@@ -93,10 +93,12 @@ Bindings follow GNU screen's defaults, including the `C-x` variants
 | `C-a l`, `C-a C-l` | redraw                     |
 | `C-a a`   | send a literal `C-a`                |
 
-`boo ui` adds bindings for switching (`C-a n`/`C-a p`/`C-a C-a`),
-creating (`C-a c`), killing (`C-a k`), and renaming (`C-a r`)
-sessions; pressing `C-a` alone lists them in the bottom bar. See
-`boo help ui`.
+`boo ui` adds a command palette: pressing `C-a` opens a modal to
+fuzzy-find sessions or run commands (new, kill, rename, quit, ...),
+and prompts such as kill confirmation and renaming open as modals
+too. Control variants run commands directly: `C-a C-c` create,
+`C-a C-k` kill, `C-a C-r` rename, `C-a C-n`/`C-a C-p`/`C-a C-a`
+switch, `C-a C-d` quit. See `boo help ui`.
 
 ## Automation
 

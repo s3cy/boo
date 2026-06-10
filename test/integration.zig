@@ -1090,9 +1090,10 @@ test "ui: sidebar lists sessions and the focused session renders in the viewport
     // The UI renders on the alternate screen, like attach.
     try std.testing.expect(std.mem.indexOf(u8, ui.output.items, "\x1b[?1049h") != null);
 
-    // C-a p focuses the previous (other) session; typing lands there.
+    // C-a C-p focuses the previous (other) session; typing lands
+    // there.
     ui.clearOutput();
-    try ui.send("\x01p");
+    try ui.send("\x01\x10");
     try ui.send("AA-TYPED-MARK\r");
     try ui.waitFor("AA-TYPED-MARK");
     const peeked = try h.waitPeekContains("aa", "AA-TYPED-MARK");
@@ -1171,10 +1172,11 @@ test "ui: a row touching the viewport's right edge keeps its last cell" {
     // from a variable so the echoed command line cannot match.
     try h.sendLine("edge", "T=EDGE; printf \"\\\\033[3;71H${T}Z\"");
     try ui.waitFor("EDGEZ");
-    // The status bar repaints after arming the prefix, so once the
-    // keybind bar shows, the marker row's frame is fully captured.
+    // The palette repaints after arming the prefix, so once its
+    // title shows, the marker row's frame is fully captured. The
+    // centered palette box stays clear of row 3.
     try ui.send("\x01");
-    try ui.waitFor("r rename");
+    try ui.waitFor("sessions & commands");
     try ui.send("\x1b");
 
     // Erase-to-EOL emitted after a full-width row would eat the last
@@ -1204,7 +1206,7 @@ test "ui: the empty state shows the ghost and the keybind hint" {
     defer ui.deinit();
     try ui.waitFor("(o o)");
     try ui.waitFor("no sessions");
-    try ui.waitFor("Press Ctrl+A for Keybinds");
+    try ui.waitFor("Ctrl+A opens the palette");
 }
 
 test "ui: clicking a session in the sidebar focuses it" {
@@ -1243,15 +1245,17 @@ test "ui: create and kill sessions from the ui" {
     defer ui.deinit();
     try ui.waitFor("keep2");
 
-    // Clicking '+ new session' (the top sidebar row) creates a
-    // session (named after the cwd or the creating pid) and focuses
-    // it.
+    // Clicking '+ new session' (the top sidebar row) opens the
+    // new-session modal; an empty name creates a session named
+    // after the cwd or the creating pid and focuses it.
     try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
+    try ui.waitFor("enter create");
+    try ui.send("\r");
     try waitUiSessionCount(&h, 3);
 
-    // C-a k asks for confirmation, then kills the focused (new)
-    // session.
-    try ui.send("\x01k");
+    // C-a C-k opens the kill confirmation modal, then kills the
+    // focused (new) session.
+    try ui.send("\x01\x0b");
     try ui.waitFor("? y/n");
     try ui.send("y");
     try waitUiSessionCount(&h, 2);
@@ -1294,7 +1298,7 @@ test "ui: quit with C-a d leaves sessions running and restores the terminal" {
     defer ui.deinit();
     try ui.waitFor("survivor");
 
-    try ui.send("\x01d");
+    try ui.send("\x01\x04");
     try ui.waitFor("[boo ui closed]");
     try std.testing.expectEqual(@as(u32, 0), try ui.waitExit());
 
@@ -1318,7 +1322,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     try h.startDetached("rz", &.{"/bin/sh"});
 
     // 100 columns - 24 sidebar - 1 separator = 75 viewport columns;
-    // 24 rows - 1 status bar = 23 viewport rows.
+    // without a status bar the viewport keeps all 24 rows.
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("rz");
@@ -1329,7 +1333,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     defer alloc.free(cmd);
 
     try h.sendLine("rz", cmd);
-    try waitFileEquals(alloc, size_file, "23 75\n");
+    try waitFileEquals(alloc, size_file, "24 75\n");
 
     // Resizing the outer terminal resizes the viewport with it.
     try ui.setSize(30, 120);
@@ -1339,7 +1343,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         const content = std.fs.cwd().readFileAlloc(alloc, size_file, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
-        if (std.mem.eql(u8, content, "29 95\n")) break;
+        if (std.mem.eql(u8, content, "30 95\n")) break;
         try deadline.tick("viewport resize never reached the session");
     }
 }
@@ -1417,7 +1421,7 @@ test "ui: a stolen view reclaims the session once the thief lets go" {
     try ui.waitFor("BACK-MARK");
 }
 
-test "ui: the status bar reveals keybinds and C-a r renames" {
+test "ui: the rename modal renames the focused session" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -1427,21 +1431,11 @@ test "ui: the status bar reveals keybinds and C-a r renames" {
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("oldname");
-    try ui.waitFor("Keybinds: Ctrl+A");
 
-    // Arming the prefix swaps the hint for the keybind list; Esc
-    // backs out and the hint returns.
-    try ui.send("\x01");
-    try ui.waitFor("r rename");
-    try ui.waitFor("esc cancel");
-    ui.clearOutput();
-    try ui.send("\x1b");
-    try ui.waitFor("Keybinds: Ctrl+A");
-
-    // C-a r opens the prompt pre-filled with the old name; erase it
-    // and type a new one.
-    try ui.send("\x01r");
-    try ui.waitFor("rename oldname:");
+    // C-a C-r opens the rename modal pre-filled with the old name;
+    // erase it and type a new one.
+    try ui.send("\x01\x12");
+    try ui.waitFor("rename session");
     try ui.send("\x7f\x7f\x7f\x7f\x7f\x7f\x7f");
     try ui.send("fresh\r");
     try ui.waitFor("renamed oldname to fresh");
@@ -1453,6 +1447,70 @@ test "ui: the status bar reveals keybinds and C-a r renames" {
     defer alloc.free(ls.stderr);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "fresh") != null);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "oldname") == null);
+}
+
+test "ui: the palette fuzzy-finds sessions and runs commands" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+    try h.startDetached("beta", &.{"cat"});
+    try h.sendLine("beta", "BETA-SEED");
+    const beta_seeded = try h.waitPeekContains("beta", "BETA-SEED");
+    alloc.free(beta_seeded);
+    try h.sendLine("alpha", "ALPHA-MARK");
+    const seeded = try h.waitPeekContains("alpha", "ALPHA-MARK");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("ALPHA-MARK"); // most recent session focused
+
+    // C-a opens the palette; Esc closes it again.
+    try ui.send("\x01");
+    try ui.waitFor("sessions & commands");
+    try ui.send("\x1b");
+
+    // Printable bytes after C-a feed the filter: "bet" matches only
+    // beta, and enter focuses it. Its screen renders once focused.
+    try ui.send("\x01bet");
+    try ui.send("\r");
+    try ui.waitFor("BETA-SEED");
+    try ui.send("BETA-TYPED\r");
+    const peeked = try h.waitPeekContains("beta", "BETA-TYPED");
+    defer alloc.free(peeked);
+
+    // Running the kill command from the palette opens the kill
+    // confirmation modal for the focused session.
+    try ui.send("\x01kill\r");
+    try ui.waitFor("kill beta? y/n");
+    try ui.send("y");
+    try waitUiSessionCount(&h, 1);
+}
+
+test "ui: the new-session modal creates a named session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("seed", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("seed");
+
+    // C-a C-c opens the prompt; the typed name is used verbatim.
+    try ui.send("\x01\x03");
+    try ui.waitFor("enter create");
+    try ui.send("minty\r");
+    try ui.waitFor("created minty");
+    try waitUiSessionCount(&h, 2);
+
+    const ls = try h.run(&.{"ls"});
+    defer alloc.free(ls.stdout);
+    defer alloc.free(ls.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "minty") != null);
 }
 
 test "ui: session titles render in the sidebar" {

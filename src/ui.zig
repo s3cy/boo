@@ -43,9 +43,10 @@ const render_interval_ms: i64 = 15;
 // -- Layout -----------------------------------------------------------------
 
 /// Screen geometry: a sidebar on the left, a one-column separator,
-/// the session viewport filling the rest, and a full-width status
-/// bar on the last row. The viewport always reaches the right edge,
-/// so erase-to-end-of-line stays inside it.
+/// and the session viewport filling the rest. The viewport always
+/// reaches the right edge, so erase-to-end-of-line stays inside it.
+/// Prompts, confirmations, and the palette render as centered
+/// modals over this layout; there is no status bar.
 pub const Layout = struct {
     rows: u16,
     cols: u16,
@@ -71,9 +72,9 @@ pub const Layout = struct {
         return self.cols -| (self.sidebar_w + 1);
     }
 
-    /// Viewport rows: everything above the status bar.
+    /// Viewport rows: the full screen height.
     pub fn viewportRows(self: Layout) u16 {
-        return self.rows -| 1;
+        return self.rows;
     }
 
     /// First viewport column, 0-based.
@@ -81,10 +82,10 @@ pub const Layout = struct {
         return self.sidebar_w + 1;
     }
 
-    /// Sidebar rows available for session entries between the
-    /// new-session button (plus its gap row) and the status bar.
+    /// Sidebar rows available for session entries under the
+    /// new-session button and its gap row.
     pub fn listRows(self: Layout) u16 {
-        return self.rows -| (list_top + 1);
+        return self.rows -| list_top;
     }
 
     /// Whole session entries that fit in the list area.
@@ -97,7 +98,6 @@ pub const Layout = struct {
         /// rows per session; scroll applied by the caller).
         session: struct { row: u16, kill: bool },
         new_button,
-        status,
         viewport: struct { x: u16, y: u16 },
         none,
     };
@@ -106,7 +106,6 @@ pub const Layout = struct {
     /// report whether the kill target ('x' in the last column) was hit.
     pub fn hit(self: Layout, x: u16, y: u16) Hit {
         if (y >= self.rows or x >= self.cols) return .none;
-        if (y == self.rows -| 1) return .status; // full-width bar
         if (x >= self.viewportX()) {
             return .{ .viewport = .{ .x = x - self.viewportX(), .y = y } };
         }
@@ -581,6 +580,69 @@ pub fn appendSessionTitleRow(
     try out.appendSlice(alloc, sgr_reset);
 }
 
+// -- Modals -------------------------------------------------------------------
+
+/// Case-insensitive subsequence match: every byte of `query` must
+/// appear in `text` in order. The empty query matches everything.
+pub fn fuzzyMatches(query: []const u8, text: []const u8) bool {
+    var ti: usize = 0;
+    outer: for (query) |q| {
+        const want = std.ascii.toLower(q);
+        while (ti < text.len) {
+            const have = std.ascii.toLower(text[ti]);
+            ti += 1;
+            if (have == want) continue :outer;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Commands offered by the palette. Most are also bound to a C-a
+/// control variant (C-a C-k kills, ...).
+pub const Command = enum {
+    new,
+    kill,
+    rename,
+    quit,
+    redraw,
+    literal,
+
+    /// Whether the command acts on the focused session and is
+    /// therefore meaningless without one.
+    pub fn needsSession(self: Command) bool {
+        return switch (self) {
+            .kill, .rename, .literal => true,
+            .new, .quit, .redraw => false,
+        };
+    }
+};
+
+/// The palette label of a command, naming the focused session for
+/// commands that act on it.
+fn commandLabel(cmd: Command, session: ?[]const u8, buf: []u8) []const u8 {
+    return switch (cmd) {
+        .new => "new session",
+        .kill => std.fmt.bufPrint(buf, "kill {s}", .{session.?}) catch "kill",
+        .rename => std.fmt.bufPrint(buf, "rename {s}", .{session.?}) catch "rename",
+        .quit => "quit ui (sessions keep running)",
+        .redraw => "redraw",
+        .literal => "send a literal C-a",
+    };
+}
+
+const box_tl = "\u{256D}"; // rounded corners
+const box_tr = "\u{256E}";
+const box_bl = "\u{2570}";
+const box_br = "\u{256F}";
+const box_h = "\u{2500}";
+const box_v = "\u{2502}";
+
+/// Preferred modal width; clipped on narrow terminals.
+const modal_width: u16 = 46;
+/// Result rows visible in the palette list.
+const palette_slots: u16 = 8;
+
 // -- The UI -------------------------------------------------------------------
 
 var signal_pipe: posix.fd_t = -1;
@@ -671,12 +733,15 @@ const Ui = struct {
     view: ?*View = null,
 
     parser: InputParser = .{},
-    /// Pending kill confirmation: index into sessions.
-    confirm_kill: ?usize = null,
-    /// Rename input buffer; non-null while the rename prompt is open.
-    rename_input: ?std.ArrayList(u8) = null,
-    /// Session index being renamed while the prompt is open.
-    rename_target: usize = 0,
+    /// The open modal, when any: kill confirmation, rename or
+    /// new-session prompt, or the palette.
+    modal: ?Modal = null,
+    /// A CSI sequence typed while a modal is open is being swallowed
+    /// (its final byte may navigate the palette).
+    modal_csi: bool = false,
+    /// Events seen while feeding the parser; readTty uses these to
+    /// tell a consumed prefix from one cancelled with Esc.
+    feed_saw_event: bool = false,
     /// Transient status message and its expiry time.
     message: std.ArrayList(u8) = .empty,
     message_deadline: i64 = 0,
@@ -709,12 +774,48 @@ const Ui = struct {
 
     const CellPos = struct { x: u16, y: u16 };
 
+    const Modal = union(enum) {
+        /// Kill confirmation; the owned name of the session to kill.
+        kill: []u8,
+        /// Rename prompt: the owned old name and the edit buffer.
+        rename: Rename,
+        /// New-session prompt; an empty name picks one automatically.
+        create: Create,
+        /// Fuzzy session/command palette.
+        palette: Palette,
+
+        const Rename = struct { name: []u8, input: std.ArrayList(u8) };
+        const Create = struct { input: std.ArrayList(u8) = .empty };
+        const Palette = struct {
+            input: std.ArrayList(u8) = .empty,
+            /// Index into the filtered item list.
+            selected: usize = 0,
+        };
+
+        fn deinit(self: *Modal, alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .kill => |name| alloc.free(name),
+                .rename => |*r| {
+                    alloc.free(r.name);
+                    r.input.deinit(alloc);
+                },
+                .create => |*c| c.input.deinit(alloc),
+                .palette => |*p| p.input.deinit(alloc),
+            }
+        }
+    };
+
+    const PaletteItem = union(enum) {
+        session: usize,
+        command: Command,
+    };
+
     fn deinit(self: *Ui) void {
         if (self.view) |v| v.destroy();
         freeEntries(self.alloc, &self.sessions);
         if (self.last_name) |n| self.alloc.free(n);
         if (self.view_name) |n| self.alloc.free(n);
-        if (self.rename_input) |*input| input.deinit(self.alloc);
+        if (self.modal) |*m| m.deinit(self.alloc);
         self.message.deinit(self.alloc);
         for (self.row_cache.items) |*row| row.deinit(self.alloc);
         self.row_cache.deinit(self.alloc);
@@ -827,41 +928,31 @@ const Ui = struct {
         const Handler = struct {
             ui: *Ui,
             pub fn event(h: @This(), ev: InputEvent) !void {
+                h.ui.feed_saw_event = true;
                 try h.ui.handleEvent(ev);
             }
         };
-        // The status bar shows the keybind list while the prefix is
-        // armed, so arming and disarming both need a repaint.
         const was_pending = self.parser.pending_prefix;
+        self.feed_saw_event = false;
         try self.parser.feed(buf[0..n], Handler{ .ui = self });
-        if (self.parser.pending_prefix != was_pending) self.need_render = true;
+        if (self.parser.pending_prefix and self.modal == null) {
+            // A C-a with no command byte yet: open the palette. A
+            // command byte arriving in the same read skips it.
+            self.openPalette();
+        } else if (was_pending and !self.parser.pending_prefix and
+            !self.feed_saw_event and self.paletteOpen())
+        {
+            // The armed prefix was cancelled with a lone Esc, which
+            // the parser swallows; close the palette it opened.
+            self.closeModal();
+        }
     }
 
     fn handleEvent(self: *Ui, ev: InputEvent) !void {
-        // An open rename prompt captures keyboard input.
-        if (self.rename_input != null) {
-            if (self.handleRenameEvent(ev)) return;
-        }
-
-        // A pending kill confirmation swallows the next key.
-        if (self.confirm_kill) |idx| {
-            switch (ev) {
-                .forward => |bytes| {
-                    self.confirm_kill = null;
-                    if (bytes.len > 0 and (bytes[0] == 'y' or bytes[0] == 'Y')) {
-                        self.killSession(idx);
-                    } else {
-                        self.setMessage("kill cancelled", .{});
-                    }
-                    return;
-                },
-                .prefix => {
-                    self.confirm_kill = null;
-                    self.setMessage("kill cancelled", .{});
-                    return;
-                },
-                else => {},
-            }
+        // An open modal captures input; palette prefix bytes fall
+        // through to handlePrefix, which feeds its filter.
+        if (self.modal != null) {
+            if (self.handleModalEvent(ev)) return;
         }
 
         switch (ev) {
@@ -886,46 +977,28 @@ const Ui = struct {
         }
     }
 
-    /// Input while the rename prompt is open edits the new name.
-    /// Returns true when the event was consumed.
-    fn handleRenameEvent(self: *Ui, ev: InputEvent) bool {
-        const input = &(self.rename_input.?);
+    /// Input while a modal is open. Returns true when the event was
+    /// consumed by the modal.
+    fn handleModalEvent(self: *Ui, ev: InputEvent) bool {
         switch (ev) {
             .forward => |bytes| {
-                // A bare escape cancels; longer escape sequences
-                // (arrow keys and friends) are ignored.
-                if (bytes.len > 0 and bytes[0] == 0x1b) {
-                    if (bytes.len == 1) self.cancelRename();
-                    return true;
-                }
-                for (bytes) |byte| switch (byte) {
-                    '\r', '\n' => {
-                        self.commitRename();
-                        return true;
-                    },
-                    0x7f, 0x08 => _ = input.pop(),
-                    0x03 => {
-                        self.cancelRename();
-                        return true;
-                    },
-                    else => {
-                        if (byte >= 0x20 and byte < 0x7f and
-                            input.items.len < paths.max_name_len)
-                        {
-                            input.append(self.alloc, byte) catch {};
-                        }
-                    },
-                };
-                self.need_render = true;
+                self.modalKeys(bytes);
                 return true;
             },
             .prefix => {
-                self.cancelRename();
+                // The palette shares the prefix key map: control
+                // bytes run commands and printable bytes filter.
+                // Prompts are simply cancelled, like the old bar.
+                if (self.modal.? == .palette) return false;
+                self.closeModal();
                 return true;
             },
             .mouse => |m| {
+                // A press anywhere dismisses the modal; motion and
+                // releases are swallowed so drags cannot reach the
+                // viewport underneath.
                 if (!m.release and !m.isMotion() and !m.isWheel()) {
-                    self.cancelRename();
+                    self.closeModal();
                 }
                 return true;
             },
@@ -933,38 +1006,177 @@ const Ui = struct {
         }
     }
 
+    /// Keyboard bytes routed to the open modal: text editing for the
+    /// prompts and the palette filter, y/n for the kill confirmation,
+    /// arrows or C-n/C-p for palette navigation.
+    fn modalKeys(self: *Ui, bytes: []const u8) void {
+        if (self.modal.? == .kill) {
+            // The first key answers the confirmation: y kills,
+            // anything else backs out.
+            if (bytes.len == 0) return;
+            const name = self.modal.?.kill;
+            const idx = self.sessionIndex(name);
+            const yes = bytes[0] == 'y' or bytes[0] == 'Y';
+            self.closeModal();
+            if (yes) {
+                if (idx) |i| self.killSession(i);
+            }
+            return;
+        }
+
+        var i: usize = 0;
+        while (i < bytes.len) : (i += 1) {
+            const byte = bytes[i];
+
+            if (self.modal_csi) {
+                // Swallow the rest of an escape sequence; the final
+                // byte of an arrow navigates the palette.
+                if (byte >= 0x40 and byte <= 0x7e) {
+                    self.modal_csi = false;
+                    switch (byte) {
+                        'A' => self.modalMove(-1),
+                        'B' => self.modalMove(1),
+                        else => {},
+                    }
+                }
+                continue;
+            }
+
+            switch (byte) {
+                0x1b => {
+                    // A lone Esc closes the modal; with a '[' behind
+                    // it a CSI sequence (arrows and friends) starts,
+                    // which must not leak into the input.
+                    if (i + 1 < bytes.len and bytes[i + 1] == '[') {
+                        self.modal_csi = true;
+                        i += 1;
+                    } else {
+                        self.closeModal();
+                        return;
+                    }
+                },
+                '\r', '\n' => {
+                    self.modalSubmit();
+                    return;
+                },
+                0x7f, 0x08 => self.modalErase(),
+                0x03 => {
+                    self.closeModal();
+                    return;
+                },
+                0x0e => self.modalMove(1), // C-n
+                0x10 => self.modalMove(-1), // C-p
+                else => {
+                    if (byte >= 0x20 and byte < 0x7f) self.modalType(byte);
+                },
+            }
+        }
+    }
+
+    fn modalType(self: *Ui, byte: u8) void {
+        switch (self.modal.?) {
+            .kill => unreachable, // handled in modalKeys
+            .rename => |*r| appendInput(self.alloc, &r.input, byte),
+            .create => |*c| appendInput(self.alloc, &c.input, byte),
+            .palette => |*p| {
+                appendInput(self.alloc, &p.input, byte);
+                p.selected = 0;
+            },
+        }
+        self.need_render = true;
+    }
+
+    fn modalErase(self: *Ui) void {
+        switch (self.modal.?) {
+            .kill => unreachable, // handled in modalKeys
+            .rename => |*r| _ = r.input.pop(),
+            .create => |*c| _ = c.input.pop(),
+            .palette => |*p| {
+                _ = p.input.pop();
+                p.selected = 0;
+            },
+        }
+        self.need_render = true;
+    }
+
+    fn modalMove(self: *Ui, delta: i2) void {
+        if (!self.paletteOpen()) return;
+        var items: std.ArrayList(PaletteItem) = .empty;
+        defer items.deinit(self.alloc);
+        self.paletteItems(&items) catch return;
+        const len = items.items.len;
+        if (len == 0) return;
+        const p = &self.modal.?.palette;
+        const cur = @min(p.selected, len - 1);
+        p.selected = if (delta > 0)
+            (cur + 1) % len
+        else
+            (cur + len - 1) % len;
+        self.need_render = true;
+    }
+
+    fn modalSubmit(self: *Ui) void {
+        switch (self.modal.?) {
+            .kill => unreachable, // handled in modalKeys
+            .rename => self.commitRename(),
+            .create => self.commitCreate(),
+            .palette => self.paletteExecute(),
+        }
+    }
+
     fn handlePrefix(self: *Ui, byte: u8) !void {
         switch (byte) {
-            'c', 0x03 => self.createSession(),
-            'k', 0x0b => self.confirmKill(),
-            'r', 0x12 => self.startRename(),
-            'd', 0x04, 'q' => self.quitting = true,
-            'n', 0x0e => self.focusOffset(1),
-            'p', 0x10 => self.focusOffset(-1),
-            keys.escape_byte => self.focusLast(),
-            'l', 0x0c => {
-                // Re-seed the local terminal from daemon state and
-                // repaint everything.
-                if (self.liveView()) |v| {
-                    v.sendInput(&.{ keys.escape_byte, 'l' }) catch self.markViewLost();
-                }
-                self.full_render = true;
-                self.need_render = true;
+            0x03 => self.openCreate(), // C-c
+            0x0b => self.openKillSelected(), // C-k
+            0x12 => self.openRenameSelected(), // C-r
+            0x04 => self.quitting = true, // C-d
+            0x0e => { // C-n
+                self.closeModal();
+                self.focusOffset(1);
             },
-            'a' => {
-                // Literal C-a: the daemon's own prefix parser turns
-                // C-a a into a raw 0x01 for the application.
-                if (self.liveView()) |v| {
-                    v.sendInput(&.{ keys.escape_byte, 'a' }) catch self.markViewLost();
-                }
+            0x10 => { // C-p
+                self.closeModal();
+                self.focusOffset(-1);
+            },
+            keys.escape_byte => { // C-a C-a
+                self.closeModal();
+                self.focusLast();
+            },
+            0x0c => self.redraw(), // C-l
+            '\r' => {
+                if (self.paletteOpen()) self.paletteExecute();
+            },
+            0x7f, 0x08 => {
+                if (self.paletteOpen()) self.modalErase();
             },
             else => {
                 if (std.ascii.isPrint(byte)) {
-                    self.setMessage("^A {c} is not bound (press Ctrl+A alone for keybinds)", .{byte});
+                    // Printable bytes feed the palette filter, so
+                    // C-a k starts a search for "k".
+                    if (!self.paletteOpen()) self.openPalette();
+                    self.modalType(byte);
                 } else {
-                    self.setMessage("^A ^{c} is not bound (press Ctrl+A alone for keybinds)", .{byte ^ 0x40});
+                    self.setMessage("^A ^{c} is not bound (press Ctrl+A for the palette)", .{byte ^ 0x40});
                 }
             },
+        }
+    }
+
+    fn redraw(self: *Ui) void {
+        // Re-seed the local terminal from daemon state and repaint
+        // everything.
+        if (self.liveView()) |v| {
+            v.sendInput(&.{ keys.escape_byte, 'l' }) catch self.markViewLost();
+        }
+        self.full_render = true;
+        self.need_render = true;
+    }
+
+    fn sendLiteralPrefix(self: *Ui) void {
+        // Literal C-a: the daemon's own prefix parser turns C-a a
+        // into a raw 0x01 for the application.
+        if (self.liveView()) |v| {
+            v.sendInput(&.{ keys.escape_byte, 'a' }) catch self.markViewLost();
         }
     }
 
@@ -972,13 +1184,6 @@ const Ui = struct {
         if (m.x == 0 or m.y == 0) return;
         const x: u16 = m.x - 1;
         const y: u16 = m.y - 1;
-
-        // A click anywhere answers a pending kill confirmation with
-        // "no"; a click on a kill target re-arms it below.
-        if (self.confirm_kill != null and !m.release and !m.isMotion() and !m.isWheel()) {
-            self.confirm_kill = null;
-            self.need_render = true;
-        }
 
         // An in-progress viewport selection captures the drag and the
         // release wherever the pointer wanders.
@@ -1023,14 +1228,14 @@ const Ui = struct {
                 const idx = self.scroll + s.row / Layout.entry_rows;
                 if (idx >= self.sessions.items.len) return;
                 if (s.kill and s.row % Layout.entry_rows == 0) {
-                    self.armKillConfirm(idx);
+                    self.openKill(idx);
                     return;
                 }
                 self.focusIndex(idx);
             },
             .new_button => {
                 if (m.release or m.isMotion()) return;
-                self.createSession();
+                self.openCreate();
             },
             else => {},
         }
@@ -1434,29 +1639,155 @@ const Ui = struct {
 
     fn focusLast(self: *Ui) void {
         const want = self.last_name orelse return;
-        for (self.sessions.items, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.name, want)) {
-                self.focusIndex(i);
-                return;
-            }
+        if (self.sessionIndex(want)) |i| {
+            self.focusIndex(i);
+            return;
         }
         self.setMessage("no previous session", .{});
+    }
+
+    fn sessionIndex(self: *Ui, name: []const u8) ?usize {
+        for (self.sessions.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.name, name)) return i;
+        }
+        return null;
+    }
+
+    // -- Modal state -------------------------------------------------------
+
+    fn closeModal(self: *Ui) void {
+        if (self.modal) |*m| {
+            m.deinit(self.alloc);
+            self.modal = null;
+            self.modal_csi = false;
+            self.need_render = true;
+        }
+    }
+
+    fn setModal(self: *Ui, modal: Modal) void {
+        self.closeModal();
+        self.modal = modal;
+        // The modal renders where a stale toast would distract.
+        self.message.clearRetainingCapacity();
+        self.message_deadline = 0;
+        self.need_render = true;
+    }
+
+    fn paletteOpen(self: *Ui) bool {
+        const m = self.modal orelse return false;
+        return m == .palette;
+    }
+
+    fn openPalette(self: *Ui) void {
+        self.setModal(.{ .palette = .{} });
+    }
+
+    fn openCreate(self: *Ui) void {
+        self.setModal(.{ .create = .{} });
+    }
+
+    fn openKill(self: *Ui, idx: usize) void {
+        if (idx >= self.sessions.items.len) return;
+        const name = self.alloc.dupe(u8, self.sessions.items[idx].name) catch return;
+        self.setModal(.{ .kill = name });
+    }
+
+    fn openKillSelected(self: *Ui) void {
+        const idx = self.selected orelse {
+            self.setMessage("no session to kill", .{});
+            return;
+        };
+        self.openKill(idx);
+    }
+
+    fn openRenameSelected(self: *Ui) void {
+        const idx = self.selected orelse {
+            self.setMessage("no session to rename", .{});
+            return;
+        };
+        const name = self.alloc.dupe(u8, self.sessions.items[idx].name) catch return;
+        var input: std.ArrayList(u8) = .empty;
+        // Pre-fill with the current name for quick edits.
+        input.appendSlice(self.alloc, name) catch {};
+        self.setModal(.{ .rename = .{ .name = name, .input = input } });
+    }
+
+    fn appendInput(alloc: std.mem.Allocator, input: *std.ArrayList(u8), byte: u8) void {
+        if (input.items.len >= paths.max_name_len) return;
+        input.append(alloc, byte) catch {};
+    }
+
+    /// Sessions and commands matching the palette filter, sessions
+    /// first in sidebar order. Commands that act on the focused
+    /// session are omitted when nothing is focused.
+    fn paletteItems(self: *Ui, out: *std.ArrayList(PaletteItem)) !void {
+        const query = self.modal.?.palette.input.items;
+        for (self.sessions.items, 0..) |entry, i| {
+            if (fuzzyMatches(query, entry.name)) {
+                try out.append(self.alloc, .{ .session = i });
+            }
+        }
+        const focused: ?[]const u8 = if (self.selected) |i|
+            self.sessions.items[i].name
+        else
+            null;
+        for (std.enums.values(Command)) |cmd| {
+            if (cmd.needsSession() and focused == null) continue;
+            var buf: [paths.max_name_len + 16]u8 = undefined;
+            if (fuzzyMatches(query, commandLabel(cmd, focused, &buf))) {
+                try out.append(self.alloc, .{ .command = cmd });
+            }
+        }
+    }
+
+    /// Run the selected palette item: focus a session or execute a
+    /// command.
+    fn paletteExecute(self: *Ui) void {
+        var items: std.ArrayList(PaletteItem) = .empty;
+        defer items.deinit(self.alloc);
+        self.paletteItems(&items) catch return;
+        if (items.items.len == 0) return;
+        const selected = self.modal.?.palette.selected;
+        const item = items.items[@min(selected, items.items.len - 1)];
+        self.closeModal();
+        switch (item) {
+            .session => |idx| self.focusIndex(idx),
+            .command => |cmd| self.runCommand(cmd),
+        }
+    }
+
+    fn runCommand(self: *Ui, cmd: Command) void {
+        switch (cmd) {
+            .new => self.openCreate(),
+            .kill => self.openKillSelected(),
+            .rename => self.openRenameSelected(),
+            .quit => self.quitting = true,
+            .redraw => self.redraw(),
+            .literal => self.sendLiteralPrefix(),
+        }
     }
 
     /// Create a session by re-running our own binary with `new -d`.
     /// The exec drops every inherited descriptor (they are all
     /// CLOEXEC), so the daemon cannot pin the UI's sockets open, and
-    /// naming falls back exactly like the CLI.
-    fn createSession(self: *Ui) void {
+    /// an omitted name falls back exactly like the CLI.
+    fn createSession(self: *Ui, name: ?[]const u8) void {
         const exe = std.fs.selfExePathAlloc(self.alloc) catch {
             self.setMessage("create failed", .{});
             return;
         };
         defer self.alloc.free(exe);
 
+        var argv_buf: [4][]const u8 = .{ exe, "new", "-d", undefined };
+        var argv: [][]const u8 = argv_buf[0..3];
+        if (name) |n| {
+            argv_buf[3] = n;
+            argv = argv_buf[0..4];
+        }
+
         const result = std.process.Child.run(.{
             .allocator = self.alloc,
-            .argv = &.{ exe, "new", "-d" },
+            .argv = argv,
         }) catch {
             self.setMessage("create failed", .{});
             return;
@@ -1469,58 +1800,33 @@ const Ui = struct {
             self.setMessage("create failed: {s}", .{reason});
             return;
         }
-        const name = std.mem.trimRight(u8, result.stdout, "\n");
-        self.setMessage("created {s}", .{name});
+        const created = std.mem.trimRight(u8, result.stdout, "\n");
+        self.setMessage("created {s}", .{created});
 
         self.refreshSessions() catch return;
-        for (self.sessions.items, 0..) |entry, i| {
-            if (std.mem.eql(u8, entry.name, name)) {
-                self.focusIndex(i);
-                break;
-            }
+        if (self.sessionIndex(created)) |i| self.focusIndex(i);
+    }
+
+    /// Validate the typed name and create the session, closing the
+    /// prompt. An empty name lets `boo new` pick one.
+    fn commitCreate(self: *Ui) void {
+        const input = self.modal.?.create.input.items;
+        if (input.len > 0) {
+            paths.validateName(input) catch {
+                self.setMessage("invalid session name '{s}'", .{input});
+                self.closeModal();
+                return;
+            };
         }
-    }
-
-    fn confirmKill(self: *Ui) void {
-        const idx = self.selected orelse {
-            self.setMessage("no session to kill", .{});
-            return;
-        };
-        self.armKillConfirm(idx);
-    }
-
-    fn armKillConfirm(self: *Ui, idx: usize) void {
-        self.confirm_kill = idx;
-        // The prompt renders from confirm_kill; a stale transient
-        // message would cover it up.
-        self.message.clearRetainingCapacity();
-        self.message_deadline = 0;
-        self.need_render = true;
-    }
-
-    fn startRename(self: *Ui) void {
-        const idx = self.selected orelse {
-            self.setMessage("no session to rename", .{});
-            return;
-        };
-        self.confirm_kill = null;
-        self.rename_target = idx;
-        var input: std.ArrayList(u8) = .empty;
-        // Pre-fill with the current name for quick edits.
-        input.appendSlice(self.alloc, self.sessions.items[idx].name) catch {};
-        if (self.rename_input) |*old| old.deinit(self.alloc);
-        self.rename_input = input;
-        // The prompt renders from rename_input; a stale transient
-        // message would cover it up.
-        self.message.clearRetainingCapacity();
-        self.message_deadline = 0;
-        self.need_render = true;
-    }
-
-    fn cancelRename(self: *Ui) void {
-        if (self.rename_input) |*input| input.deinit(self.alloc);
-        self.rename_input = null;
-        self.setMessage("rename cancelled", .{});
+        // The modal owns the buffer and closing frees it; creation
+        // outlives the modal, so copy the name out first.
+        var name_buf: [paths.max_name_len]u8 = undefined;
+        const name: ?[]const u8 = if (input.len > 0) blk: {
+            @memcpy(name_buf[0..input.len], input);
+            break :blk name_buf[0..input.len];
+        } else null;
+        self.closeModal();
+        self.createSession(name);
     }
 
     /// Ask the daemon to rename the prompt's target session. On
@@ -1528,39 +1834,46 @@ const Ui = struct {
     /// restored by name on refresh, and the attached view's socket
     /// stays connected across the rename.
     fn commitRename(self: *Ui) void {
-        var input = self.rename_input.?;
-        self.rename_input = null;
-        defer input.deinit(self.alloc);
-        const new_name = input.items;
+        const r = &self.modal.?.rename;
+        const old_name = r.name;
+        const new_name = r.input.items;
 
-        const idx = self.rename_target;
-        if (idx >= self.sessions.items.len) return;
-        const entry = &self.sessions.items[idx];
-        if (std.mem.eql(u8, entry.name, new_name)) {
-            self.need_render = true;
+        if (std.mem.eql(u8, old_name, new_name)) {
+            self.closeModal();
             return;
         }
         paths.validateName(new_name) catch {
             self.setMessage("invalid session name '{s}'", .{new_name});
+            self.closeModal();
             return;
         };
 
-        const sock = paths.socketPath(self.alloc, self.dir, entry.name) catch return;
+        const sock = paths.socketPath(self.alloc, self.dir, old_name) catch {
+            self.closeModal();
+            return;
+        };
         defer self.alloc.free(sock);
         const result = client.control(self.alloc, sock, &.{ "rename", new_name }) catch {
             self.setMessage("rename failed", .{});
+            self.closeModal();
             return;
         };
         defer self.alloc.free(result.text);
         if (!result.ok) {
             self.setMessage("{s}", .{result.text});
+            self.closeModal();
             return;
         }
 
-        self.setMessage("renamed {s} to {s}", .{ entry.name, new_name });
-        const owned = self.alloc.dupe(u8, new_name) catch return;
-        self.alloc.free(entry.name);
-        entry.name = owned;
+        self.setMessage("renamed {s} to {s}", .{ old_name, new_name });
+        if (self.sessionIndex(old_name)) |idx| {
+            if (self.alloc.dupe(u8, new_name)) |owned| {
+                const entry = &self.sessions.items[idx];
+                self.alloc.free(entry.name);
+                entry.name = owned;
+            } else |_| {}
+        }
+        self.closeModal();
         self.refreshSessions() catch {};
     }
 
@@ -1682,7 +1995,7 @@ const Ui = struct {
 
     fn cursorSequence(self: *Ui) CursorState {
         var state: CursorState = .{};
-        if (self.renameCursor()) |s| return s;
+        if (self.modal != null) return self.modalCursor();
         const v = self.liveView() orelse return state;
         const cursor = &v.term.screens.active.cursor;
         const row: usize = @min(cursor.y, self.layout.viewportRows() -| 1);
@@ -1699,17 +2012,21 @@ const Ui = struct {
         return state;
     }
 
-    /// While the rename prompt is open, the cursor sits at the end
-    /// of the typed name in the status bar.
-    fn renameCursor(self: *Ui) ?CursorState {
-        const input = self.rename_input orelse return null;
-        if (self.rename_target >= self.sessions.items.len) return null;
+    /// While a modal with a text input is open, the cursor sits at
+    /// the end of the typed text; the kill confirmation hides it.
+    fn modalCursor(self: *Ui) CursorState {
         var state: CursorState = .{};
-        const prompt_len = " rename ".len +
-            self.sessions.items[self.rename_target].name.len + ": ".len;
-        const col = @min(prompt_len + input.items.len + 1, self.layout.cols);
+        const rect = self.modalRect() orelse return state;
+        const input: []const u8 = switch (self.modal.?) {
+            .kill => return state,
+            .rename => |r| r.input.items,
+            .create => |c| c.input.items,
+            .palette => |p| p.input.items,
+        };
+        // The input row is "\u{2502} > " followed by the text.
+        const col = @min(rect.x + 5 + input.len, rect.x + rect.w - 2);
         const text = std.fmt.bufPrint(&state.pos, "\x1b[{d};{d}H", .{
-            self.layout.rows,
+            rect.y + 2,
             col,
         }) catch return state;
         state.pos_len = text.len;
@@ -1717,60 +2034,225 @@ const Ui = struct {
         return state;
     }
 
-    /// One full screen row. The last row is the full-width status
-    /// bar; every other row is sidebar columns, separator, then the
-    /// viewport slice. The sidebar segment is always exactly
-    /// sidebar_w columns so the row never bleeds into the viewport.
+    /// One full screen row: sidebar columns, separator, then the
+    /// viewport slice, with any modal and toast drawn over the top.
+    /// The sidebar segment is always exactly sidebar_w columns so
+    /// the row never bleeds into the viewport.
     fn composeRow(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
 
         try out.appendSlice(alloc, sgr_reset);
-        if (y == self.layout.rows -| 1) {
-            try self.composeStatusRow(out);
-            return;
-        }
         try self.composeSidebarCell(y, out);
         try out.appendSlice(alloc, style_dim);
         try out.appendSlice(alloc, "\u{2502}");
         try out.appendSlice(alloc, sgr_reset);
         try self.composeViewportCell(y, out);
+        try self.composeModalOverlay(y, out);
+        try self.composeToast(y, out);
     }
 
-    const keybind_bar =
-        " c new  k kill  r rename  n/p switch  d quit  C-a last  a literal  l redraw  esc cancel";
-
-    /// The full-width bar on the last screen row: rename prompt, kill
-    /// confirmation, the keybind list while the prefix is armed, a
-    /// transient message, or the default hint.
-    fn composeStatusRow(self: *Ui, out: *std.ArrayList(u8)) !void {
+    /// A transient toast over the last row, replacing the old status
+    /// bar: centered, inverse, gone once the message expires.
+    fn composeToast(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
+        if (y != self.layout.rows -| 1) return;
+        if (self.message.items.len == 0) return;
         const alloc = self.alloc;
         const w = self.layout.cols;
+        if (w < 8) return;
+        const text_w: u16 = @intCast(@min(self.message.items.len, w - 4));
+        const x = (w - (text_w + 2)) / 2;
+        try out.print(alloc, "\x1b[{d};{d}H", .{ y + 1, x + 1 });
+        try out.appendSlice(alloc, sgr_reset ++ style_selected);
+        try out.append(alloc, ' ');
+        try appendClipped(alloc, out, self.message.items, text_w);
+        try out.append(alloc, ' ');
+        try out.appendSlice(alloc, sgr_reset);
+    }
 
-        try out.appendSlice(alloc, style_dim);
-        var text: std.ArrayList(u8) = .empty;
-        defer text.deinit(alloc);
+    const ModalRect = struct { x: u16, y: u16, w: u16, h: u16 };
 
-        // Prompts outlive transient messages, so they are regenerated
-        // from their state rather than stored.
-        if (self.rename_input) |input| {
-            if (self.rename_target < self.sessions.items.len) {
-                try text.print(alloc, " rename {s}: {s}", .{
-                    self.sessions.items[self.rename_target].name,
-                    input.items,
-                });
-            }
-        } else if (self.confirm_kill) |idx| {
-            if (idx < self.sessions.items.len) {
-                try text.print(alloc, " kill {s}? y/n", .{self.sessions.items[idx].name});
-            }
-        } else if (self.parser.pending_prefix) {
-            try text.appendSlice(alloc, keybind_bar);
-        } else if (self.message.items.len > 0) {
-            try text.print(alloc, " {s}", .{self.message.items});
-        } else {
-            try text.appendSlice(alloc, " Keybinds: Ctrl+A");
+    /// Centered geometry of the open modal: top border, body rows,
+    /// a hint row, bottom border. Null when the terminal is too
+    /// small to draw a box at all.
+    fn modalRect(self: *Ui) ?ModalRect {
+        const m = self.modal orelse return null;
+        const l = self.layout;
+        if (l.cols < 12 or l.rows < 4) return null;
+        const w: u16 = @min(l.cols - 2, modal_width);
+        const h: u16 = switch (m) {
+            .kill, .rename, .create => 4,
+            .palette => @min(l.rows, 4 + palette_slots),
+        };
+        return .{
+            .x = (l.cols - w) / 2,
+            .y = (l.rows - h) / 2,
+            .w = w,
+            .h = h,
+        };
+    }
+
+    /// Draw the open modal's slice of screen row `y` over the
+    /// already composed row content.
+    fn composeModalOverlay(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
+        const rect = self.modalRect() orelse return;
+        if (y < rect.y or y >= rect.y + rect.h) return;
+        const line = y - rect.y;
+
+        try out.print(self.alloc, "\x1b[{d};{d}H", .{ y + 1, rect.x + 1 });
+        try out.appendSlice(self.alloc, sgr_reset);
+
+        if (line == 0) return self.composeModalTop(rect, out);
+        if (line == rect.h - 1) return self.composeModalBorder(rect, box_bl, box_br, out);
+        if (line == rect.h - 2) return self.composeModalHint(rect, out);
+        try self.composeModalBody(rect, line, out);
+    }
+
+    fn modalTitle(self: *Ui) []const u8 {
+        return switch (self.modal.?) {
+            .kill => "kill session",
+            .rename => "rename session",
+            .create => "new session",
+            .palette => "sessions & commands",
+        };
+    }
+
+    fn modalHint(self: *Ui) []const u8 {
+        return switch (self.modal.?) {
+            .kill => "y kill   any other key cancels",
+            .rename => "enter rename   esc cancel",
+            .create => "enter create   esc cancel",
+            .palette => "type to filter   enter run   esc close",
+        };
+    }
+
+    /// The top border with the title embedded: ╭─ title ───╮.
+    fn composeModalTop(self: *Ui, rect: ModalRect, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        const title = self.modalTitle();
+        try out.appendSlice(alloc, box_tl);
+        var used: u16 = 0;
+        if (rect.w >= title.len + 6) {
+            try out.appendSlice(alloc, box_h ++ " ");
+            try out.appendSlice(alloc, title);
+            try out.append(alloc, ' ');
+            used = @intCast(title.len + 3);
         }
-        try appendClipped(alloc, out, text.items, w);
+        while (used < rect.w - 2) : (used += 1) try out.appendSlice(alloc, box_h);
+        try out.appendSlice(alloc, box_tr);
+    }
+
+    fn composeModalBorder(
+        self: *Ui,
+        rect: ModalRect,
+        comptime left: []const u8,
+        comptime right: []const u8,
+        out: *std.ArrayList(u8),
+    ) !void {
+        const alloc = self.alloc;
+        try out.appendSlice(alloc, left);
+        var used: u16 = 0;
+        while (used < rect.w - 2) : (used += 1) try out.appendSlice(alloc, box_h);
+        try out.appendSlice(alloc, right);
+    }
+
+    fn composeModalHint(self: *Ui, rect: ModalRect, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        try out.appendSlice(alloc, box_v ++ " ");
+        try out.appendSlice(alloc, style_dim);
+        try appendClipped(alloc, out, self.modalHint(), rect.w - 4);
+        try out.appendSlice(alloc, sgr_reset);
+        try out.appendSlice(alloc, " " ++ box_v);
+    }
+
+    /// An interior modal row between the top border and the hint.
+    fn composeModalBody(self: *Ui, rect: ModalRect, line: u16, out: *std.ArrayList(u8)) !void {
+        const alloc = self.alloc;
+        const iw: u16 = rect.w - 4;
+        try out.appendSlice(alloc, box_v ++ " ");
+        switch (self.modal.?) {
+            .kill => |name| {
+                var buf: [paths.max_name_len + 16]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "kill {s}? y/n", .{name}) catch "kill? y/n";
+                try appendClipped(alloc, out, text, iw);
+            },
+            .rename => |r| try composeInputLine(alloc, out, r.input.items, null, iw),
+            .create => |c| try composeInputLine(alloc, out, c.input.items, "(automatic name)", iw),
+            .palette => |p| {
+                if (line == 1) {
+                    try composeInputLine(alloc, out, p.input.items, null, iw);
+                } else {
+                    try self.composePaletteSlot(p, rect, line - 2, iw, out);
+                }
+            },
+        }
+        try out.appendSlice(alloc, " " ++ box_v);
+    }
+
+    /// "> {text}" padded to `width`; a dim placeholder shows while
+    /// the input is empty.
+    fn composeInputLine(
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        text: []const u8,
+        placeholder: ?[]const u8,
+        width: u16,
+    ) !void {
+        if (width < 2) return appendClipped(alloc, out, "", width);
+        try out.appendSlice(alloc, "> ");
+        if (text.len == 0) {
+            if (placeholder) |ph| {
+                try out.appendSlice(alloc, style_dim);
+                try appendClipped(alloc, out, ph, width - 2);
+                try out.appendSlice(alloc, sgr_reset);
+                return;
+            }
+        }
+        try appendClipped(alloc, out, text, width - 2);
+    }
+
+    /// One palette result row. The window of visible items follows
+    /// the selection; the selected row renders in inverse video.
+    fn composePaletteSlot(
+        self: *Ui,
+        p: Modal.Palette,
+        rect: ModalRect,
+        slot: u16,
+        width: u16,
+        out: *std.ArrayList(u8),
+    ) !void {
+        const alloc = self.alloc;
+        var items: std.ArrayList(PaletteItem) = .empty;
+        defer items.deinit(alloc);
+        self.paletteItems(&items) catch return appendClipped(alloc, out, "", width);
+
+        const len = items.items.len;
+        if (len == 0) {
+            if (slot == 0) {
+                try out.appendSlice(alloc, style_dim);
+                try appendClipped(alloc, out, "no matches", width);
+                try out.appendSlice(alloc, sgr_reset);
+            } else {
+                try appendClipped(alloc, out, "", width);
+            }
+            return;
+        }
+
+        const slots: usize = rect.h - 4;
+        const selected = @min(p.selected, len - 1);
+        const start = if (selected >= slots) selected + 1 - slots else 0;
+        const idx = start + slot;
+        if (idx >= len) return appendClipped(alloc, out, "", width);
+
+        if (idx == selected) try out.appendSlice(alloc, style_selected);
+        var buf: [paths.max_name_len + 16]u8 = undefined;
+        const label: []const u8 = switch (items.items[idx]) {
+            .session => |s| self.sessions.items[s].name,
+            .command => |cmd| commandLabel(cmd, if (self.selected) |s|
+                self.sessions.items[s].name
+            else
+                null, &buf),
+        };
+        try appendClipped(alloc, out, label, width);
         try out.appendSlice(alloc, sgr_reset);
     }
 
@@ -1915,7 +2397,7 @@ const Ui = struct {
 
         const text: []const u8 = switch (line) {
             art_h + 1 => "no sessions",
-            art_h + 2 => "Press Ctrl+A for Keybinds",
+            art_h + 2 => "Ctrl+A opens the palette",
             else => return,
         };
         if (text.len >= vw) return;
@@ -2152,15 +2634,14 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 24), l.sidebar_w);
     try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 25), l.viewportX());
-    try std.testing.expectEqual(@as(u16, 23), l.viewportRows());
-    try std.testing.expectEqual(@as(usize, 10), l.visibleEntries());
+    try std.testing.expectEqual(@as(u16, 24), l.viewportRows());
+    try std.testing.expectEqual(@as(usize, 11), l.visibleEntries());
 
-    // The new-session button is the top row, a blank gap sits under
-    // it, and the status bar spans the full width of the last row.
+    // The new-session button is the top row with a blank gap under
+    // it; without a status bar the session list reaches the last row.
     try std.testing.expectEqual(Layout.Hit.new_button, l.hit(3, 0));
     try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 1));
-    try std.testing.expectEqual(Layout.Hit.status, l.hit(3, 23));
-    try std.testing.expectEqual(Layout.Hit.status, l.hit(80, 23));
+    try std.testing.expectEqual(@as(u16, 21), l.hit(3, 23).session.row);
     try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 5)); // separator
 
     // Sessions take two display rows: name, then title.
@@ -2174,6 +2655,7 @@ test "layout: geometry and hit testing" {
     const v = l.hit(30, 7);
     try std.testing.expectEqual(@as(u16, 5), v.viewport.x);
     try std.testing.expectEqual(@as(u16, 7), v.viewport.y);
+    try std.testing.expectEqual(@as(u16, 23), l.hit(80, 23).viewport.y);
 
     try std.testing.expectEqual(Layout.Hit.none, l.hit(100, 5));
 }
@@ -2182,6 +2664,118 @@ test "layout: narrow terminals shrink the sidebar" {
     const l = Layout.init(24, 48);
     try std.testing.expectEqual(@as(u16, 16), l.sidebar_w);
     try std.testing.expect(l.viewportCols() > 0);
+}
+
+test "fuzzy matching is a case-insensitive subsequence" {
+    try std.testing.expect(fuzzyMatches("", "anything"));
+    try std.testing.expect(fuzzyMatches("ku", "kube"));
+    try std.testing.expect(fuzzyMatches("ube", "kube"));
+    try std.testing.expect(fuzzyMatches("KB", "kube"));
+    try std.testing.expect(fuzzyMatches("ks", "kill sessions"));
+    try std.testing.expect(!fuzzyMatches("kk", "kube"));
+    try std.testing.expect(!fuzzyMatches("x", "kube"));
+    try std.testing.expect(!fuzzyMatches("kube", "ku"));
+}
+
+test "palette: typing filters sessions and commands" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    defer ui.closeModal();
+
+    var alpha = "alpha".*;
+    var beta = "beta".*;
+    var no_title: [0]u8 = .{};
+    try ui.sessions.append(alloc, .{ .name = &alpha, .attached = false, .idle_ms = 0, .title = &no_title });
+    try ui.sessions.append(alloc, .{ .name = &beta, .attached = false, .idle_ms = 0, .title = &no_title });
+    ui.selected = 0;
+
+    ui.openPalette();
+    try std.testing.expect(ui.paletteOpen());
+
+    // The empty filter lists every session and every command.
+    var items: std.ArrayList(Ui.PaletteItem) = .empty;
+    defer items.deinit(alloc);
+    try ui.paletteItems(&items);
+    const command_count = std.enums.values(Command).len;
+    try std.testing.expectEqual(@as(usize, 2 + command_count), items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), items.items[0].session);
+
+    // "bet" matches the session beta but neither alpha nor any
+    // command label.
+    ui.modalType('b');
+    ui.modalType('e');
+    ui.modalType('t');
+    items.clearRetainingCapacity();
+    try ui.paletteItems(&items);
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), items.items[0].session);
+
+    // "kill" narrows down to the kill command, which names the
+    // focused session.
+    ui.modalErase();
+    ui.modalErase();
+    ui.modalErase();
+    for ("kill") |byte| ui.modalType(byte);
+    items.clearRetainingCapacity();
+    try ui.paletteItems(&items);
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+    try std.testing.expectEqual(Command.kill, items.items[0].command);
+}
+
+test "palette: commands needing a session disappear without one" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    defer ui.closeModal();
+
+    ui.openPalette();
+    var items: std.ArrayList(Ui.PaletteItem) = .empty;
+    defer items.deinit(alloc);
+    try ui.paletteItems(&items);
+    for (items.items) |item| {
+        try std.testing.expect(!item.command.needsSession());
+    }
+}
+
+test "modal: the kill confirmation renders as a centered box" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    defer ui.closeModal();
+    ui.layout = .init(24, 100);
+
+    var victim = "victim".*;
+    var no_title: [0]u8 = .{};
+    try ui.sessions.append(alloc, .{ .name = &victim, .attached = false, .idle_ms = 0, .title = &no_title });
+    ui.selected = 0;
+    ui.openKillSelected();
+
+    const rect = ui.modalRect().?;
+    try std.testing.expectEqual(@as(u16, 46), rect.w);
+    try std.testing.expectEqual(@as(u16, 4), rect.h);
+    try std.testing.expectEqual(@as(u16, 27), rect.x);
+    try std.testing.expectEqual(@as(u16, 10), rect.y);
+
+    // The top border carries the title; the body carries the prompt.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try ui.composeRow(rect.y, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, box_tl) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "kill session") != null);
+
+    out.clearRetainingCapacity();
+    try ui.composeRow(rect.y + 1, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "kill victim? y/n") != null);
+
+    out.clearRetainingCapacity();
+    try ui.composeRow(rect.y + 3, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, box_bl) != null);
+
+    // Rows outside the modal stay untouched.
+    out.clearRetainingCapacity();
+    try ui.composeRow(0, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, box_v ++ " ") == null);
 }
 
 test "sidebar session row is exactly the requested width" {

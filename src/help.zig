@@ -116,31 +116,44 @@ pub const commands = [_]Entry{
         \\Manage sessions in a full-screen interface: a sidebar lists
         \\every session (window title underneath) and the focused
         \\session runs in a viewport on the right, rendered live from
-        \\terminal state.
+        \\terminal state. Prompts and confirmations open as modals
+        \\over the screen.
         \\
         \\mouse:
         \\  click a session     focus it (steals politely, like attach)
-        \\  click its 'x'       kill it (asks for confirmation)
-        \\  click + new session start a session running $SHELL
+        \\  click its 'x'       kill it (opens a confirmation modal)
+        \\  click + new session open the new-session modal
+        \\  click on a modal    close it
         \\  scroll the sidebar  scroll the session list
         \\  in the viewport     forwarded to the application when it
         \\                      asked for mouse reporting; otherwise
         \\                      dragging selects text and copies it on
         \\                      release (OSC 52)
         \\
-        \\keys (prefix C-a, control variants match GNU screen):
-        \\  C-a c   create a session and focus it
-        \\  C-a k   kill the focused session (asks y/n)
-        \\  C-a r   rename the focused session
-        \\  C-a n   focus the next session
-        \\  C-a p   focus the previous session
-        \\  C-a C-a focus the previously focused session
-        \\  C-a d   quit the UI (sessions keep running)
-        \\  C-a l   redraw
-        \\  C-a a   send a literal C-a to the application
-        \\  C-a Esc cancel the armed prefix
+        \\keys (prefix C-a):
+        \\  C-a       open the palette: fuzzy-find a session or run
+        \\            a command (new, kill, rename, quit, ...)
+        \\  C-a C-c   open the new-session modal
+        \\  C-a C-k   kill the focused session (confirmation modal)
+        \\  C-a C-r   rename the focused session
+        \\  C-a C-n   focus the next session
+        \\  C-a C-p   focus the previous session
+        \\  C-a C-a   focus the previously focused session
+        \\  C-a C-d   quit the UI (sessions keep running)
+        \\  C-a C-l   redraw
+        \\  C-a Esc   close the palette / cancel the prefix
         \\
-        \\Pressing C-a alone lists these bindings in the bottom bar.
+        \\In the palette, type to filter, move with up/down (or C-n/
+        \\C-p), run the selection with enter, and close with esc.
+        \\Printable keys after C-a feed the filter, so C-a k searches
+        \\for "k"; the single-letter screen bindings live on as
+        \\palette commands and as the control variants above. A
+        \\literal C-a is sent with the palette's "send a literal
+        \\C-a" command.
+        \\
+        \\The new-session modal creates a session running $SHELL;
+        \\leave the name empty to pick one automatically, like
+        \\'boo new'.
         \\
         \\Everything else is typed into the focused session. Unlike a
         \\plain attach, pasted text may contain C-a bytes safely
