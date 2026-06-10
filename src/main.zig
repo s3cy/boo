@@ -9,7 +9,7 @@ const daemonpkg = @import("daemon.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 
-pub const version = "0.0.1";
+pub const version = "0.0.2";
 
 const usage =
     \\usage: ghostscreen [options] [command ...]

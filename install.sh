@@ -53,22 +53,35 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 log "Downloading $url"
-if command -v curl >/dev/null 2>&1; then
-	curl -fsSL -o "$tmp/$asset" "$url" ||
+download() {
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL -o "$tmp/$asset" "$url"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$tmp/$asset" "$url"
+	else
+		fail "curl or wget is required"
+	fi
+}
+if ! download; then
+	# Private and internal repositories reject anonymous downloads.
+	# Retry through gh, which uses its own authentication.
+	command -v gh >/dev/null 2>&1 ||
 		fail "download failed; is the release published and the repository public?"
-elif command -v wget >/dev/null 2>&1; then
-	wget -qO "$tmp/$asset" "$url" ||
-		fail "download failed; is the release published and the repository public?"
-else
-	fail "curl or wget is required"
+	log "Anonymous download failed; retrying with gh"
+	rm -f "$tmp/$asset"
+	if [ "$version" = "latest" ]; then
+		gh release download --repo "$REPO" --pattern "$asset" --dir "$tmp" ||
+			fail "gh release download failed"
+	else
+		gh release download "v${version#v}" --repo "$REPO" --pattern "$asset" --dir "$tmp" ||
+			fail "gh release download failed"
+	fi
 fi
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$install_dir"
 install -m 0755 "$tmp/ghostscreen" "$install_dir/ghostscreen"
 
-# The v0.0.1 binary prints its version to stderr; later versions use
-# stdout. Capture both.
 log "Installed $("$install_dir/ghostscreen" -V 2>&1) to $install_dir/ghostscreen"
 case ":$PATH:" in
 *":$install_dir:"*) ;;
