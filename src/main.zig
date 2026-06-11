@@ -190,8 +190,10 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) 
     };
 }
 
-/// Run a control command against a session, mapping a missing daemon
-/// to the documented exit code.
+/// Run a control command against a session, mapping a missing or
+/// mid-teardown daemon to the documented exit code. An EOF on the
+/// control connection means the daemon died before replying, so it is
+/// reported the same as a daemon that is already gone.
 fn mustControl(
     alloc: std.mem.Allocator,
     dir: []const u8,
@@ -201,7 +203,7 @@ fn mustControl(
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
     return client.control(alloc, sock, argv) catch |err| switch (err) {
-        error.FileNotFound, error.ConnectionRefused => fail(
+        error.FileNotFound, error.ConnectionRefused, error.ConnectionLost => fail(
             exit_no_session,
             "no session named {s}",
             .{name},

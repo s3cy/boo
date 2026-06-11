@@ -1193,6 +1193,25 @@ test "agent loop: new, send, wait, peek, kill" {
     try h.runExit(&.{ "peek", "agent" }, 3);
 }
 
+test "kill: peek immediately after kill reports no session" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Once kill is acked the socket file is already unlinked, so a
+    // back-to-back peek must deterministically resolve "no session"
+    // (exit 3) and never observe EOF from the dying daemon. Repeat to
+    // amplify the former race between the kill ack and teardown.
+    var i: usize = 0;
+    var name_buf: [16]u8 = undefined;
+    while (i < 10) : (i += 1) {
+        const name = try std.fmt.bufPrint(&name_buf, "reap{d}", .{i});
+        try h.startDetached(name, &.{"sh"});
+        try h.runOk(&.{ "kill", name });
+        try h.runExit(&.{ "peek", name }, 3);
+    }
+}
+
 test "rename: moves a session to a new name" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
