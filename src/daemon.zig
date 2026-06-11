@@ -119,12 +119,21 @@ pub const Daemon = struct {
             self.alloc.destroy(c);
         }
         self.conns.deinit(self.alloc);
-        posix.close(self.opts.listen_fd);
-        std.fs.cwd().deleteFile(self.opts.socket_path) catch {};
+        self.retireListener();
         if (self.owned_name) |n| self.alloc.free(n);
         if (self.owned_socket_path) |p| self.alloc.free(p);
         if (self.sig_read >= 0) posix.close(self.sig_read);
         if (sigchld_pipe >= 0) posix.close(sigchld_pipe);
+    }
+
+    /// Close the listening socket and remove its file so new clients
+    /// resolve "no session" instead of connecting to a dying daemon
+    /// and reading EOF.
+    fn retireListener(self: *Daemon) void {
+        if (self.opts.listen_fd < 0) return;
+        posix.close(self.opts.listen_fd);
+        self.opts.listen_fd = -1;
+        std.fs.cwd().deleteFile(self.opts.socket_path) catch {};
     }
 
     fn loop(self: *Daemon) !void {
@@ -397,6 +406,11 @@ pub const Daemon = struct {
             }
             self.rename(conn, argv[1]);
         } else if (std.mem.eql(u8, cmd, "quit")) {
+            // Retire the listener before acking: by the time the kill
+            // client sees the reply, the socket file is gone, so a
+            // follow-up command resolves "no session" instead of
+            // connecting to the dying daemon and reading EOF.
+            self.retireListener();
             conn.send(.ok, "");
             if (self.win) |w| {
                 posix.kill(w.child_pid, posix.SIG.HUP) catch {};
