@@ -565,8 +565,12 @@ const style_dim = "\x1b[2m";
 /// Display width in terminal columns of one codepoint: 0 for
 /// combining and other zero-width marks, 2 for East Asian wide and
 /// fullwidth characters, 1 otherwise. A compact wcwidth-style
-/// approximation; only sidebar and status chrome is measured here,
-/// session content renders through libghostty's formatter.
+/// approximation of the width table ghostty applies to session
+/// content; that table lives in ghostty's src/unicode, is generated
+/// at build time, and is not exported through the ghostty-vt
+/// module, so chrome text approximates it locally. Only sidebar and
+/// status chrome is measured here, session content renders through
+/// libghostty's formatter and never passes through this table.
 fn codepointWidth(cp: u21) u2 {
     return switch (cp) {
         // Zero width: combining marks, joiners, and variation
