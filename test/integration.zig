@@ -1880,6 +1880,127 @@ test "ui: a single esc cancels the rename prompt" {
     try ui.waitFor("rename cancelled");
 }
 
+test "ui: kitty keyboard state mirrors to the client terminal" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The app enables kitty disambiguation, pops it after one byte of
+    // input, and echoes everything else visibly via cat -v.
+    try h.startDetached("kty", &.{
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; " ++
+            "head -c 1 >/dev/null; printf '\\033[<u'; echo KITTY-OFF; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("kty", "KITTY-ON");
+    alloc.free(seeded);
+
+    // The UI mirrors the focused view's kitty flags onto the real
+    // terminal, the way a plain attach's repaint does.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("KITTY-ON");
+    try ui.waitFor("\x1b[=1;1u");
+
+    // The app popping its flags un-mirrors the terminal. The startup
+    // sequence also carries an =0 reset, so only output after the
+    // mirror counts.
+    ui.clearOutput();
+    try ui.send("x");
+    try ui.waitFor("KITTY-OFF");
+    try ui.waitFor("\x1b[=0;1u");
+}
+
+test "ui: kitty-encoded keys reach the application verbatim" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ktf", &.{
+        "sh",                                                                 "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("ktf", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[=1;1u");
+
+    // Shift+Enter, as a kitty-mode terminal encodes it, is the
+    // application's input and must arrive untouched (the original
+    // failure mode downgraded it to a plain Enter).
+    try ui.send("\x1b[13;2u");
+    const enter = try h.waitPeekContains("ktf", "^[[13;2u");
+    alloc.free(enter);
+
+    // The Esc key, kitty-encoded, arrives immediately; nothing eats
+    // it waiting for a second press.
+    try ui.send("\x1b[27u");
+    const esc = try h.waitPeekContains("ktf", "^[[27u");
+    alloc.free(esc);
+}
+
+test "ui: kitty-encoded C-a is the prefix, not session input" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ktp", &.{
+        "sh",                                                                 "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("ktp", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[=1;1u");
+
+    // C-a d the way a kitty-mode terminal sends it quits the UI.
+    try ui.send("\x1b[97;5u");
+    try ui.send("d");
+    try ui.waitFor("[boo ui closed]");
+    try std.testing.expectEqual(@as(u32, 0), try ui.waitExit());
+
+    // The keys were intercepted, not leaked into the session.
+    const peek = try h.run(&.{ "peek", "ktp" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
+}
+
+test "ui: prompts suspend the mirrored kitty flags" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("ktg", &.{
+        "sh",                                                                 "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; exec cat -v",
+    });
+    const seeded = try h.waitPeekContains("ktg", "KITTY-ON");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("\x1b[=1;1u");
+
+    // Opening the goto prompt drops the mirrored flags, so prompt
+    // input keeps its legacy byte encodings.
+    ui.clearOutput();
+    try ui.send("\x1b[97;5u");
+    try ui.send("g");
+    try ui.waitFor(" goto: ");
+    try ui.waitFor("\x1b[=0;1u");
+
+    // A lone ESC cancels the prompt and the mirror returns.
+    try ui.send("\x1b");
+    try ui.waitFor("goto cancelled");
+    try ui.waitFor("\x1b[=1;1u");
+}
+
 test "ui: C-a g goes to a session by name" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

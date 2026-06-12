@@ -165,6 +165,10 @@ pub const InputEvent = union(enum) {
     paste: bool,
     /// Focus in (true) / out (false).
     focus: bool,
+    /// The Esc key: a lone 0x1b delivered after the flush timeout, or
+    /// its kitty CSI-u encoding. Carries the original bytes so an
+    /// unconsumed Esc forwards to the session exactly as typed.
+    esc: []const u8,
 
     pub const Arrow = struct {
         dir: Dir,
@@ -179,22 +183,34 @@ pub const InputEvent = union(enum) {
 /// markers. Everything else passes through untouched. While a paste
 /// is open the prefix byte is NOT special, so pasted 0x01 bytes reach
 /// the application (unlike a plain attach).
+///
+/// When the focused application runs the kitty keyboard protocol the
+/// real terminal mirrors that state, so the parser also recognizes
+/// the CSI-u encodings of the prefix key, of the command key that
+/// follows it, and of the Esc key; every other CSI-u sequence passes
+/// through to the session unchanged.
 pub const InputParser = struct {
     /// A C-a was seen; the next byte is a command key.
     pending_prefix: bool = false,
     /// Held bytes of a possible CSI sequence that may need to be
-    /// intercepted (arrows and mouse/focus/paste reports). Replayed
-    /// verbatim the moment the sequence diverges.
+    /// intercepted (arrows, mouse/focus/paste reports, and kitty
+    /// CSI-u keys). Replayed verbatim the moment the sequence
+    /// diverges.
     held: [hold_max]u8 = undefined,
     held_len: u8 = 0,
     /// The held sequence followed an armed prefix: an arrow binds to
-    /// it (C-a Up/Down), anything else cancels the prefix as before.
+    /// it (C-a Up/Down) and a CSI-u key decodes to the command key;
+    /// anything else cancels the prefix as before.
     prefix_held: bool = false,
     in_paste: bool = false,
+    /// Kitty CSI-u recognition is active: the real terminal mirrors
+    /// the focused application's kitty keyboard flags.
+    kitty: bool = false,
 
     const hold_max = 40;
 
-    pub fn feed(self: *InputParser, input: []const u8, handler: anytype) !void {
+    pub fn feed(self: *InputParser, input: []const u8, kitty: bool, handler: anytype) !void {
+        self.kitty = kitty;
         var start: usize = 0;
         var i: usize = 0;
         while (i < input.len) {
@@ -223,8 +239,11 @@ pub const InputParser = struct {
                     // mouse sequence, which must be reprocessed so
                     // its tail is not typed into the application. An
                     // arrow sequence binds back to the prefix
-                    // (C-a Up/Down) via prefix_held.
-                    if (i + 1 == input.len) {
+                    // (C-a Up/Down) via prefix_held. In kitty mode
+                    // the cancel key itself arrives CSI-u encoded,
+                    // so a bare ESC ending the read is a split
+                    // sequence and is held instead.
+                    if (!self.kitty and i + 1 == input.len) {
                         i += 1;
                     } else {
                         self.prefix_held = true;
@@ -263,13 +282,15 @@ pub const InputParser = struct {
 
     /// Whether `byte` keeps the held bytes a candidate for a sequence
     /// this parser intercepts: plain arrows (ESC [ A/B/C/D), CSI
-    /// mouse (ESC [ < ... M/m), focus (ESC [ I, ESC [ O), or paste
-    /// markers (ESC [ 200~, ESC [ 201~).
+    /// mouse (ESC [ < ... M/m), focus (ESC [ I, ESC [ O), paste
+    /// markers (ESC [ 200~, ESC [ 201~), and, in kitty mode, CSI-u
+    /// keys (ESC [ <digits...> [;:] ... u).
     fn heldAccepts(self: *const InputParser, byte: u8) bool {
         const len = self.held_len;
         if (len == 1) return byte == '[';
         if (len == 2) return switch (byte) {
             '<', 'I', 'O', '2', 'A', 'B', 'C', 'D' => true,
+            '0', '1', '3'...'9' => self.kitty,
             else => false,
         };
         return switch (self.held[2]) {
@@ -279,6 +300,11 @@ pub const InputParser = struct {
             },
             '2' => switch (byte) {
                 '0'...'9', '~' => true,
+                ';', ':', 'u' => self.kitty,
+                else => false,
+            },
+            '0', '1', '3'...'9' => switch (byte) {
+                '0'...'9', ';', ':', '~', 'u' => self.kitty,
                 else => false,
             },
             else => false,
@@ -287,7 +313,7 @@ pub const InputParser = struct {
 
     fn isCsiFinal(byte: u8) bool {
         return switch (byte) {
-            'M', 'm', '~', 'I', 'O', 'A', 'B', 'C', 'D' => true,
+            'M', 'm', '~', 'I', 'O', 'A', 'B', 'C', 'D', 'u' => true,
             else => false,
         };
     }
@@ -316,6 +342,13 @@ pub const InputParser = struct {
                 } });
             },
             else => {},
+        }
+
+        // Kitty CSI-u keys. Pasted content is the application's
+        // verbatim, like the raw prefix byte.
+        if (final == 'u') {
+            if (!self.kitty or self.in_paste) return self.flushHeld(handler);
+            return self.finishCsiU(prefixed, handler);
         }
 
         // Focus reports arrive as a bare final byte.
@@ -355,6 +388,75 @@ pub const InputParser = struct {
         } });
     }
 
+    /// A complete `ESC [ ... u` sequence is in the hold buffer: a
+    /// kitty CSI-u key. Intercepts the prefix key, the command key
+    /// that follows an armed prefix, and the Esc key, mirroring
+    /// keys.Parser; every other key is the application's input.
+    fn finishCsiU(self: *InputParser, prefixed: bool, handler: anytype) !void {
+        const seq = self.held[0..self.held_len];
+        const key = keys.parseKitty(seq[2 .. seq.len - 1]) orelse
+            return self.flushHeld(handler);
+
+        // Modifier bitmask with the lock bits ignored: caps lock or
+        // num lock must not hide the prefix.
+        const mods = (key.mods -| 1) & 0x3f;
+        const ctrl_only = mods == 0x4;
+        const plain = mods == 0;
+        const release = key.event == 3;
+
+        if (prefixed) {
+            self.held_len = 0;
+            // A release while the command key is awaited is the
+            // prefix key itself being let go; stay armed.
+            if (release) {
+                self.pending_prefix = true;
+                return;
+            }
+            // The prefix key repeating while held (or pressed again)
+            // is not a command key; stay armed.
+            if (key.cp == 'a' and ctrl_only) {
+                self.pending_prefix = true;
+                return;
+            }
+            // Modifier and lock keys are reported as keys of their
+            // own under the kitty "report all keys" flag; holding or
+            // tapping one while armed must not eat the command key.
+            if (keys.isModifierKey(key.cp)) {
+                self.pending_prefix = true;
+                return;
+            }
+            // Esc backs out of the armed prefix, like the raw byte.
+            if (key.cp == 27 and plain) return;
+            if (ctrl_only and key.cp >= 'a' and key.cp <= 'z') {
+                return handler.event(.{ .prefix = @intCast(key.cp & 0x1f) });
+            }
+            if (plain and key.cp >= 0x20 and key.cp <= 0x7f) {
+                return handler.event(.{ .prefix = @intCast(key.cp) });
+            }
+            return handler.event(.{
+                .prefix = if (key.cp <= 0x7f) @as(u8, @intCast(key.cp)) else '?',
+            });
+        }
+
+        if (key.cp == 'a' and ctrl_only) {
+            self.held_len = 0;
+            // Releases are swallowed: the session never saw the press.
+            if (!release) self.pending_prefix = true;
+            return;
+        }
+
+        if (key.cp == 27 and plain and !release) {
+            // The Esc key, unambiguously encoded: deliver it as the
+            // cancel key, with the original bytes for forwarding.
+            self.held_len = 0;
+            return handler.event(.{ .esc = seq });
+        }
+
+        // Some other key (Shift+Enter, Ctrl+C, ...): the session's
+        // input, exactly as the terminal encoded it.
+        try self.flushHeld(handler);
+    }
+
     fn parseField(field: ?[]const u8) ?u16 {
         const text = field orelse return null;
         return std.fmt.parseInt(u16, text, 10) catch null;
@@ -368,6 +470,22 @@ pub const InputParser = struct {
         self.held_len = 0;
         self.prefix_held = false;
         if (held.len > 0) try handler.event(.{ .forward = held });
+    }
+
+    /// Deliver a held lone ESC as the Esc key: the flush timeout
+    /// passed without follow-up bytes, so the user pressed the key
+    /// itself. After an armed prefix it is the cancel key and is
+    /// consumed. Any other hold replays as plain input.
+    pub fn flushEsc(self: *InputParser, handler: anytype) !void {
+        if (self.held_len != 1 or self.held[0] != 0x1b) {
+            return self.flushHeld(handler);
+        }
+        self.held_len = 0;
+        if (self.prefix_held) {
+            self.prefix_held = false;
+            return;
+        }
+        try handler.event(.{ .esc = &.{0x1b} });
     }
 };
 
@@ -748,6 +866,7 @@ const enter_sequence =
     "\x1b[?1002h\x1b[?1006h" ++ // mouse: button events, SGR encoding
     "\x1b[?1004h" ++ // focus reporting
     "\x1b[?2004h" ++ // bracketed paste
+    "\x1b[=0;1u\x1b[>4;0m" ++ // keyboard protocols off until a view sets them
     "\x1b]2;boo ui\x07"; // window title
 
 /// reset_state_sequence turns every mode above back off.
@@ -825,6 +944,14 @@ const Ui = struct {
     /// When nonzero, the parser holds a lone ESC that is flushed as
     /// input once this deadline passes without follow-up bytes.
     esc_deadline: i64 = 0,
+    /// Kitty keyboard flags currently applied to the user's real
+    /// terminal, mirroring the focused view. Nonzero only while a
+    /// kitty-protocol application is focused and no UI prompt owns
+    /// the keyboard.
+    kitty_flags: u5 = 0,
+    /// modifyOtherKeys=2 state currently applied to the user's real
+    /// terminal, mirroring the focused view.
+    modify_keys: bool = false,
     /// Pending kill confirmation: index into sessions.
     confirm_kill: ?usize = null,
     /// Rename input buffer; non-null while the rename prompt is open.
@@ -949,6 +1076,7 @@ const Ui = struct {
                     self.refreshSessions() catch {};
                 }
             }
+            self.syncKeyboard();
         }
     }
 
@@ -1007,7 +1135,7 @@ const Ui = struct {
         // The status bar shows the keybind list while the prefix is
         // armed, so arming and disarming both need a repaint.
         const was_pending = self.parser.pending_prefix;
-        try self.parser.feed(buf[0..n], Handler{ .ui = self });
+        try self.parser.feed(buf[0..n], self.kitty_flags != 0, Handler{ .ui = self });
         if (self.parser.pending_prefix != was_pending) self.need_render = true;
         // A read that ends in a bare ESC is ambiguous: the ESC key,
         // or a split escape sequence. Deliver it on a short timeout
@@ -1030,7 +1158,44 @@ const Ui = struct {
                 try h.ui.handleEvent(ev);
             }
         };
-        try self.parser.flushHeld(Handler{ .ui = self });
+        try self.parser.flushEsc(Handler{ .ui = self });
+    }
+
+    /// Whether a UI prompt or key-driven mode is reading keyboard
+    /// input byte-wise (prompts, kill confirm, browse, resize).
+    /// Mirrored keyboard protocols are suspended for its duration so
+    /// keys keep their legacy encodings.
+    fn uiOwnsKeyboard(self: *Ui) bool {
+        return self.rename_input != null or self.goto_input != null or
+            self.confirm_kill != null or self.browsing or self.resizing;
+    }
+
+    /// Mirror the focused application's keyboard protocol state
+    /// (kitty flags and modifyOtherKeys) onto the real terminal, the
+    /// same state the repaint of a plain attach replays. Without the
+    /// mirror the terminal keeps legacy encodings: Shift+Enter is
+    /// indistinguishable from Enter, and a kitty-mode application
+    /// sits on a bare Esc waiting for a sequence that never comes.
+    fn syncKeyboard(self: *Ui) void {
+        var kitty: u5 = 0;
+        var modify = false;
+        if (!self.uiOwnsKeyboard()) {
+            if (self.liveView()) |v| {
+                kitty = v.term.screens.active.kitty_keyboard.current().int();
+                modify = v.term.flags.modify_other_keys_2;
+            }
+        }
+        if (kitty != self.kitty_flags) {
+            self.kitty_flags = kitty;
+            var buf: [12]u8 = undefined;
+            const seq = std.fmt.bufPrint(&buf, "\x1b[={d};1u", .{kitty}) catch unreachable;
+            protocol.writeAll(1, seq) catch {};
+        }
+        if (modify != self.modify_keys) {
+            self.modify_keys = modify;
+            const seq: []const u8 = if (modify) "\x1b[>4;2m" else "\x1b[>4;0m";
+            protocol.writeAll(1, seq) catch {};
+        }
     }
 
     fn handleEvent(self: *Ui, ev: InputEvent) !void {
@@ -1056,7 +1221,7 @@ const Ui = struct {
                     }
                     return;
                 },
-                .prefix, .arrow => {
+                .prefix, .arrow, .esc => {
                     self.confirm_kill = null;
                     self.setMessage("kill cancelled", .{});
                     return;
@@ -1137,6 +1302,25 @@ const Ui = struct {
                 const marker: []const u8 = if (in) "\x1b[I" else "\x1b[O";
                 v.sendInput(marker) catch self.markViewLost();
             },
+            .esc => |bytes| {
+                // The Esc key cancels transient UI state the same way
+                // the lone byte does, and otherwise belongs to the
+                // application in whatever encoding the terminal used.
+                if (self.resizing) {
+                    self.cancelResize();
+                    return;
+                }
+                if (self.browsing) {
+                    self.cancelBrowse();
+                    return;
+                }
+                if (self.viewScrolled()) {
+                    self.snapViewBottom();
+                    return;
+                }
+                const v = self.liveView() orelse return;
+                v.sendInput(bytes) catch self.markViewLost();
+            },
         }
     }
 
@@ -1174,6 +1358,10 @@ const Ui = struct {
                 return true;
             },
             .prefix => {
+                self.cancelRename();
+                return true;
+            },
+            .esc => {
                 self.cancelRename();
                 return true;
             },
@@ -1226,6 +1414,10 @@ const Ui = struct {
                 return true;
             },
             .prefix => {
+                self.cancelGoto();
+                return true;
+            },
+            .esc => {
                 self.cancelGoto();
                 return true;
             },
@@ -2688,15 +2880,20 @@ const TestHandler = struct {
     alloc: std.mem.Allocator,
     events: std.ArrayList(InputEvent) = .empty,
     forwarded: std.ArrayList(u8) = .empty,
+    /// Esc-event payload bytes, copied out (they alias the parser's
+    /// hold buffer).
+    escs: std.ArrayList(u8) = .empty,
 
     fn deinit(self: *TestHandler) void {
         self.events.deinit(self.alloc);
         self.forwarded.deinit(self.alloc);
+        self.escs.deinit(self.alloc);
     }
 
     fn event(self: *TestHandler, ev: InputEvent) !void {
         switch (ev) {
             .forward => |bytes| try self.forwarded.appendSlice(self.alloc, bytes),
+            .esc => |bytes| try self.escs.appendSlice(self.alloc, bytes),
             else => try self.events.append(self.alloc, ev),
         }
     }
@@ -2706,7 +2903,7 @@ test "parser: plain bytes pass through" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("hello", &h);
+    try p.feed("hello", false, &h);
     try std.testing.expectEqualStrings("hello", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
 }
@@ -2715,7 +2912,7 @@ test "parser: prefix commands" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("ab\x01cde", &h);
+    try p.feed("ab\x01cde", false, &h);
     try std.testing.expectEqualStrings("abde", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
     try std.testing.expectEqual(InputEvent{ .prefix = 'c' }, h.events.items[0]);
@@ -2725,9 +2922,9 @@ test "parser: prefix split across feeds" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x01", &h);
+    try p.feed("\x01", false, &h);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
-    try p.feed("k", &h);
+    try p.feed("k", false, &h);
     try std.testing.expectEqual(InputEvent{ .prefix = 'k' }, h.events.items[0]);
 }
 
@@ -2735,12 +2932,12 @@ test "parser: esc backs out of an armed prefix" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x01\x1b", &h);
+    try p.feed("\x01\x1b", false, &h);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
     try std.testing.expect(!p.pending_prefix);
     // The prefix is disarmed: the next byte is plain input again.
-    try p.feed("x", &h);
+    try p.feed("x", false, &h);
     try std.testing.expectEqualStrings("x", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
 }
@@ -2751,7 +2948,7 @@ test "parser: a mouse click while the prefix is armed cancels it cleanly" {
     var p: InputParser = .{};
     // Esc with trailing bytes is the start of a sequence, not a lone
     // cancel: the sequence must parse instead of leaking into the pty.
-    try p.feed("\x01\x1b[<0;5;7M", &h);
+    try p.feed("\x01\x1b[<0;5;7M", false, &h);
     try std.testing.expect(!p.pending_prefix);
     try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
     const m = h.events.items[0].mouse;
@@ -2766,7 +2963,7 @@ test "parser: sgr mouse press and release" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[<0;5;7M\x1b[<0;5;7m", &h);
+    try p.feed("\x1b[<0;5;7M\x1b[<0;5;7m", false, &h);
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     const press = h.events.items[0].mouse;
     try std.testing.expectEqual(@as(u16, 0), press.code);
@@ -2781,8 +2978,8 @@ test "parser: mouse sequence split across feeds" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[<6", &h);
-    try p.feed("5;10;2M", &h);
+    try p.feed("\x1b[<6", false, &h);
+    try p.feed("5;10;2M", false, &h);
     try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
     const m = h.events.items[0].mouse;
     try std.testing.expectEqual(@as(u16, 65), m.code);
@@ -2794,7 +2991,7 @@ test "parser: non-intercepted CSI passes through" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[1;5A\x1b[1;5C", &h);
+    try p.feed("\x1b[1;5A\x1b[1;5C", false, &h);
     try std.testing.expectEqualStrings("\x1b[1;5A\x1b[1;5C", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
 }
@@ -2803,7 +3000,7 @@ test "parser: plain arrows become arrow events" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[A\x1b[B", &h);
+    try p.feed("\x1b[A\x1b[B", false, &h);
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(
         InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
@@ -2820,7 +3017,7 @@ test "parser: side arrows become arrow events" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[D\x1b[C", &h);
+    try p.feed("\x1b[D\x1b[C", false, &h);
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(
         InputEvent{ .arrow = .{ .dir = .left, .prefixed = false } },
@@ -2832,7 +3029,7 @@ test "parser: side arrows become arrow events" {
     );
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
     // A side arrow binds to an armed prefix like up/down do.
-    try p.feed("\x01\x1b[C", &h);
+    try p.feed("\x01\x1b[C", false, &h);
     try std.testing.expectEqual(
         InputEvent{ .arrow = .{ .dir = .right, .prefixed = true } },
         h.events.items[2],
@@ -2844,7 +3041,7 @@ test "parser: arrows bind to an armed prefix" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x01\x1b[B", &h);
+    try p.feed("\x01\x1b[B", false, &h);
     try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
     try std.testing.expectEqual(
         InputEvent{ .arrow = .{ .dir = .down, .prefixed = true } },
@@ -2853,7 +3050,7 @@ test "parser: arrows bind to an armed prefix" {
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
     // The prefix was consumed: the next bytes are plain input, and a
     // later bare arrow is not marked prefixed.
-    try p.feed("x\x1b[A", &h);
+    try p.feed("x\x1b[A", false, &h);
     try std.testing.expectEqualStrings("x", h.forwarded.items);
     try std.testing.expectEqual(
         InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
@@ -2865,9 +3062,9 @@ test "parser: arrow split across feeds" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[", &h);
+    try p.feed("\x1b[", false, &h);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
-    try p.feed("A", &h);
+    try p.feed("A", false, &h);
     try std.testing.expectEqual(
         InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
         h.events.items[0],
@@ -2879,7 +3076,7 @@ test "parser: bracketed paste protects the prefix byte" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[200~a\x01b\x1b[201~", &h);
+    try p.feed("\x1b[200~a\x01b\x1b[201~", false, &h);
     try std.testing.expectEqualStrings("a\x01b", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(InputEvent{ .paste = true }, h.events.items[0]);
@@ -2890,10 +3087,180 @@ test "parser: focus reports" {
     var h: TestHandler = .{ .alloc = std.testing.allocator };
     defer h.deinit();
     var p: InputParser = .{};
-    try p.feed("\x1b[I\x1b[O", &h);
+    try p.feed("\x1b[I\x1b[O", false, &h);
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(InputEvent{ .focus = true }, h.events.items[0]);
     try std.testing.expectEqual(InputEvent{ .focus = false }, h.events.items[1]);
+}
+
+test "parser: a held lone esc flushes as the esc key" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b", false, &h);
+    try std.testing.expectEqual(@as(usize, 0), h.escs.items.len);
+    try p.flushEsc(&h);
+    try std.testing.expectEqualStrings("\x1b", h.escs.items);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+}
+
+test "parser: kitty Ctrl+A arms the prefix, plain command key follows" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[97;5ud", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'd' }, h.events.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: kitty Ctrl+A then encoded command key" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // Encoded Ctrl+D, then (after re-arming) report-all-keys plain g.
+    try p.feed("\x1b[97;5u\x1b[100;5u", true, &h);
+    try p.feed("\x1b[97;5u\x1b[103u", true, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try std.testing.expectEqual(InputEvent{ .prefix = 0x04 }, h.events.items[0]);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'g' }, h.events.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: kitty Ctrl+A split across feeds" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[97;5", true, &h);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try p.feed("uk", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'k' }, h.events.items[0]);
+}
+
+test "parser: kitty prefix release and repeat stay armed" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // Press, repeat, release of Ctrl+A, then the command key: one
+    // command, nothing typed into the session.
+    try p.feed("\x1b[97;5u\x1b[97;5:2u\x1b[97;5:3ud", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'd' }, h.events.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    // A stray prefix release outside a pending sequence is swallowed.
+    try p.feed("\x1b[97;5:3u", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: kitty modifier key events while armed do not eat the command" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // A reported left-ctrl press between the prefix and the command
+    // (kitty report-all-keys flag) is not the command key.
+    try p.feed("\x1b[97;5u\x1b[57442;5u\x1b[100;5u", true, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(InputEvent{ .prefix = 0x04 }, h.events.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: kitty esc cancels an armed prefix" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[97;5u\x1b[27u", true, &h);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.escs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    // The prefix is disarmed: the next byte is plain input again.
+    try p.feed("x", true, &h);
+    try std.testing.expectEqualStrings("x", h.forwarded.items);
+}
+
+test "parser: kitty esc press becomes the esc key, release passes through" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[27u", true, &h);
+    try std.testing.expectEqualStrings("\x1b[27u", h.escs.items);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    h.escs.clearRetainingCapacity();
+    // The press-event form is the esc key as well.
+    try p.feed("\x1b[27;1:1u", true, &h);
+    try std.testing.expectEqualStrings("\x1b[27;1:1u", h.escs.items);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    h.escs.clearRetainingCapacity();
+    // Releases and modified Esc belong to the application.
+    try p.feed("\x1b[27;1:3u\x1b[27;2u", true, &h);
+    try std.testing.expectEqual(@as(usize, 0), h.escs.items.len);
+    try std.testing.expectEqualStrings("\x1b[27;1:3u\x1b[27;2u", h.forwarded.items);
+}
+
+test "parser: kitty other CSI-u keys pass through verbatim" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // Shift+Enter, Ctrl+B, and a bare 97 with no ctrl: session input.
+    try p.feed("\x1b[13;2u", true, &h);
+    try std.testing.expectEqualStrings("\x1b[13;2u", h.forwarded.items);
+    h.forwarded.clearRetainingCapacity();
+    try p.feed("\x1b[98;5u", true, &h);
+    try std.testing.expectEqualStrings("\x1b[98;5u", h.forwarded.items);
+    h.forwarded.clearRetainingCapacity();
+    try p.feed("\x1b[97u", true, &h);
+    try std.testing.expectEqualStrings("\x1b[97u", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.escs.items.len);
+}
+
+test "parser: kitty CSI-u encodings pass through when kitty mode is off" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[97;5ud\x1b[27u", false, &h);
+    try std.testing.expectEqualStrings("\x1b[97;5ud\x1b[27u", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.escs.items.len);
+}
+
+test "parser: kitty mode keeps mouse, paste, and arrow interception" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[<0;5;7M\x1b[200~a\x1b[201~\x1b[A", true, &h);
+    try std.testing.expectEqual(@as(usize, 4), h.events.items.len);
+    try std.testing.expectEqual(@as(u16, 5), h.events.items[0].mouse.x);
+    try std.testing.expectEqual(InputEvent{ .paste = true }, h.events.items[1]);
+    try std.testing.expectEqual(InputEvent{ .paste = false }, h.events.items[2]);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = false } },
+        h.events.items[3],
+    );
+    try std.testing.expectEqualStrings("a", h.forwarded.items);
+}
+
+test "parser: kitty CSI-u inside a paste is application input" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x1b[200~\x1b[27u\x1b[201~", true, &h);
+    try std.testing.expectEqual(@as(usize, 0), h.escs.items.len);
+    try std.testing.expectEqualStrings("\x1b[27u", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
+}
+
+test "parser: legacy escape sequences pass through in kitty mode" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // A modified arrow and an F-key: held longer than in legacy mode
+    // (the digits stay candidates) but replayed verbatim.
+    try p.feed("\x1b[1;5A\x1b[15;5~", true, &h);
+    try std.testing.expectEqualStrings("\x1b[1;5A\x1b[15;5~", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
 }
 
 test "ui: automatic focus skips attached sessions and prefers recent ones" {

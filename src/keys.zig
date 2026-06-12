@@ -226,7 +226,7 @@ pub const Parser = struct {
     }
 };
 
-const KittyKey = struct {
+pub const KittyKey = struct {
     cp: u32,
     mods: u32,
     event: u32,
@@ -235,14 +235,14 @@ const KittyKey = struct {
 /// Kitty functional codepoints for keys that never act as command
 /// keys: CAPS_LOCK, NUM_LOCK, and LEFT_SHIFT through
 /// ISO_LEVEL5_SHIFT (modifiers).
-fn isModifierKey(cp: u32) bool {
+pub fn isModifierKey(cp: u32) bool {
     return cp == 57358 or cp == 57360 or (cp >= 57441 and cp <= 57454);
 }
 
 /// Parse the parameter body of a kitty CSI-u key: sections separated
 /// by ';' (codepoint, modifiers, text), subfields by ':'. Returns null
 /// when the body is not a well-formed key encoding.
-fn parseKitty(body: []const u8) ?KittyKey {
+pub fn parseKitty(body: []const u8) ?KittyKey {
     var key: KittyKey = .{ .cp = 0, .mods = 1, .event = 1 };
     var sections = std.mem.splitScalar(u8, body, ';');
 
