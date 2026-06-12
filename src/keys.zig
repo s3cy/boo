@@ -226,6 +226,10 @@ pub const Parser = struct {
     }
 };
 
+/// A decoded kitty CSI-u key. `cp` is the unshifted unicode
+/// codepoint, `mods` the raw kitty modifier value (1 means none; the
+/// bitmask is `mods - 1`), and `event` the kind of event: 1 press,
+/// 2 repeat, 3 release.
 pub const KittyKey = struct {
     cp: u32,
     mods: u32,
@@ -233,10 +237,10 @@ pub const KittyKey = struct {
 };
 
 /// Kitty functional codepoints for keys that never act as command
-/// keys: CAPS_LOCK, NUM_LOCK, and LEFT_SHIFT through
+/// keys: CAPS_LOCK, SCROLL_LOCK, NUM_LOCK, and LEFT_SHIFT through
 /// ISO_LEVEL5_SHIFT (modifiers).
 pub fn isModifierKey(cp: u32) bool {
-    return cp == 57358 or cp == 57360 or (cp >= 57441 and cp <= 57454);
+    return (cp >= 57358 and cp <= 57360) or (cp >= 57441 and cp <= 57454);
 }
 
 /// Parse the parameter body of a kitty CSI-u key: sections separated

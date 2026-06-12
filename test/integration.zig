@@ -1917,8 +1917,9 @@ test "ui: kitty-encoded keys reach the application verbatim" {
     defer h.deinit();
 
     try h.startDetached("ktf", &.{
-        "sh",                                                                 "-c",
-        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; exec cat -v",
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
     });
     const seeded = try h.waitPeekContains("ktf", "KITTY-ON");
     alloc.free(seeded);
@@ -1947,8 +1948,9 @@ test "ui: kitty-encoded C-a is the prefix, not session input" {
     defer h.deinit();
 
     try h.startDetached("ktp", &.{
-        "sh",                                                                 "-c",
-        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; exec cat -v",
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
     });
     const seeded = try h.waitPeekContains("ktp", "KITTY-ON");
     alloc.free(seeded);
@@ -1977,8 +1979,9 @@ test "ui: prompts suspend the mirrored kitty flags" {
     defer h.deinit();
 
     try h.startDetached("ktg", &.{
-        "sh",                                                                 "-c",
-        "stty -echo -icanon; printf '\\033[>1u'; echo KITTY-ON; exec cat -v",
+        "sh", "-c",
+        "stty -echo -icanon; printf '\\033[>1u'; " ++
+            "echo KITTY-ON; exec cat -v",
     });
     const seeded = try h.waitPeekContains("ktg", "KITTY-ON");
     alloc.free(seeded);
