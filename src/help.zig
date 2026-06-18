@@ -54,7 +54,7 @@ pub const overview =
     \\environment:
     \\  BOO_DIR  socket directory
     \\           (default: $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>)
-    \\  BOO_LOG  append daemon logs to this file (debugging)
+    \\  BOO_LOG  append daemon and 'boo ui' logs to this file (debugging)
     \\
 ;
 

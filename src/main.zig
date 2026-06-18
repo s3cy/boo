@@ -13,27 +13,6 @@ const ui = @import("ui.zig");
 
 pub const version = "0.5.23";
 
-/// Route std.log through a filter. libghostty's VT stream parser logs
-/// unimplemented sequences at info level under the `stream` scope (e.g.
-/// "OSC 1 (change icon) received and ignored"). In `boo ui` the parser runs
-/// in-process with stderr still attached to the user's terminal (unlike the
-/// daemon, which redirects stderr in startDaemon), so those lines paint over
-/// the rendered viewport and corrupt it. Drop info-and-below from `stream`;
-/// every other scope logs as before.
-pub const std_options: std.Options = .{
-    .logFn = filteredLog,
-};
-
-fn filteredLog(
-    comptime level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    if (scope == .stream and @intFromEnum(level) >= @intFromEnum(std.log.Level.info)) return;
-    std.log.defaultLog(level, scope, format, args);
-}
-
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
 const exit_usage: u8 = 2;
@@ -399,7 +378,17 @@ fn cmdUi(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    ui.run(alloc, dir) catch |err| switch (err) {
+
+    // boo ui feeds session output through an in-process libghostty stream
+    // whose VT logs would otherwise paint over the viewport: std.log writes
+    // to stderr, which is the user's terminal here, while the daemon
+    // redirects its own stderr in runDaemon. Point stderr at BOO_LOG, or
+    // /dev/null, while the UI owns the screen, then restore it so the
+    // closing notice is visible.
+    const saved_stderr = redirectStderr();
+    const result = ui.run(alloc, dir);
+    restoreStderr(saved_stderr);
+    result catch |err| switch (err) {
         error.NotATty => fail(exit_runtime, "ui requires a terminal", .{}),
         else => return err,
     };
@@ -935,6 +924,43 @@ fn fmtIdle(buf: []u8, ms: i64) []const u8 {
 
 // -- Daemon plumbing ------------------------------------------------------
 
+/// Open the destination for std.log and std.debug output: $BOO_LOG
+/// (created, appended) when set, otherwise /dev/null. Both the session
+/// daemon and `boo ui` run with a terminal on stderr, where libghostty's
+/// in-process VT logging would paint over the display, so they route
+/// stderr here. Returns null when the target cannot be opened.
+fn openLogSink() ?posix.fd_t {
+    if (posix.getenv("BOO_LOG")) |log_path| {
+        return posix.open(log_path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .APPEND = true,
+        }, 0o600) catch null;
+    }
+    return posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch null;
+}
+
+/// Redirect stderr to the log sink for the lifetime of a foreground command
+/// that owns the terminal (boo ui). Returns a saved dup of the original
+/// stderr for restoreStderr, or -1 when stderr was left untouched.
+fn redirectStderr() posix.fd_t {
+    const sink = openLogSink() orelse return -1;
+    defer posix.close(sink);
+    const saved = posix.dup(posix.STDERR_FILENO) catch return -1;
+    posix.dup2(sink, posix.STDERR_FILENO) catch {
+        posix.close(saved);
+        return -1;
+    };
+    return saved;
+}
+
+/// Restore stderr from a redirectStderr handle. A no-op for -1.
+fn restoreStderr(saved: posix.fd_t) void {
+    if (saved < 0) return;
+    posix.dup2(saved, posix.STDERR_FILENO) catch {};
+    posix.close(saved);
+}
+
 fn runDaemon(
     alloc: std.mem.Allocator,
     name: []const u8,
@@ -947,19 +973,15 @@ fn runDaemon(
 ) noreturn {
     _ = posix.setsid() catch {};
 
-    // Detach stdio. Keep stderr pointed at BOO_LOG if set so std.log
-    // output is preserved for debugging.
+    // Detach stdio: stdin and stdout go to /dev/null, stderr to the log
+    // sink (BOO_LOG when set, else /dev/null) so std.log output is
+    // preserved for debugging.
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch posix.exit(1);
     posix.dup2(devnull, 0) catch {};
     posix.dup2(devnull, 1) catch {};
-    if (posix.getenv("BOO_LOG")) |log_path| blk: {
-        const fd = posix.open(log_path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .APPEND = true,
-        }, 0o600) catch break :blk;
-        posix.dup2(fd, 2) catch {};
-        posix.close(fd);
+    if (openLogSink()) |sink| {
+        posix.dup2(sink, 2) catch {};
+        posix.close(sink);
     } else {
         posix.dup2(devnull, 2) catch {};
     }
