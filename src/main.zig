@@ -946,7 +946,12 @@ fn openLogSink() ?posix.fd_t {
 fn redirectStderr() posix.fd_t {
     const sink = openLogSink() orelse return -1;
     defer posix.close(sink);
+    // Mark the saved terminal stderr close-on-exec so it is not inherited
+    // by the session daemons boo ui spawns: createSession runs `boo new`,
+    // which forks the daemon, and a leaked dup would hold the pty open
+    // after the UI exits.
     const saved = posix.dup(posix.STDERR_FILENO) catch return -1;
+    _ = posix.fcntl(saved, posix.F.SETFD, posix.FD_CLOEXEC) catch {};
     posix.dup2(sink, posix.STDERR_FILENO) catch {
         posix.close(saved);
         return -1;
