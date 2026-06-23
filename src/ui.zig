@@ -868,7 +868,13 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
 // -- Sidebar rendering --------------------------------------------------------
 
 const sgr_reset = "\x1b[0m";
+/// Reverse video, used to highlight an in-progress mouse text selection
+/// over viewport content.
 const style_selected = "\x1b[7m";
+/// Dark gray background for the selected sidebar row. A gentle bar
+/// rather than reverse video, whose bright inverted block washes out
+/// the dim title row beneath the name.
+const style_row_selected = "\x1b[48;5;238m";
 const style_dim = "\x1b[2m";
 /// Bold blue: the "your turn" marker, a bell that rang while you were
 /// away.
@@ -991,7 +997,7 @@ fn appendClipped(
 
 /// One sidebar session name row: attached marker, name, and a kill
 /// target in the last column. Exactly `width` display columns plus
-/// SGR codes; the inverse-video highlight alone marks the selected
+/// SGR codes; the background highlight alone marks the selected
 /// session.
 pub fn appendSessionRow(
     alloc: std.mem.Allocator,
@@ -1001,7 +1007,7 @@ pub fn appendSessionRow(
     selected: bool,
 ) !void {
     if (width == 0) return;
-    if (selected) try out.appendSlice(alloc, style_selected);
+    if (selected) try out.appendSlice(alloc, style_row_selected);
 
     // The leading status column, always exactly one display cell:
     //   ●  your turn: a bell rang while you were away. Bold blue.
@@ -1016,12 +1022,12 @@ pub fn appendSessionRow(
         try out.appendSlice(alloc, attention_marker);
         try out.appendSlice(alloc, sgr_reset);
         // Restore the row highlight the marker's reset cleared.
-        if (selected) try out.appendSlice(alloc, style_selected);
+        if (selected) try out.appendSlice(alloc, style_row_selected);
     } else if (entry.unread) {
         try out.appendSlice(alloc, style_dim);
         try out.appendSlice(alloc, unread_marker);
         try out.appendSlice(alloc, sgr_reset);
-        if (selected) try out.appendSlice(alloc, style_selected);
+        if (selected) try out.appendSlice(alloc, style_row_selected);
     } else {
         const marker: u8 = if (!selected and entry.attached) '*' else ' ';
         try out.append(alloc, marker);
@@ -1048,7 +1054,7 @@ pub fn appendSessionTitleRow(
     selected: bool,
 ) !void {
     if (width == 0) return;
-    if (selected) try out.appendSlice(alloc, style_selected);
+    if (selected) try out.appendSlice(alloc, style_row_selected);
     try out.appendSlice(alloc, style_dim);
 
     if (entry.title.len > 0 and width > 2) {
@@ -4232,11 +4238,11 @@ test "sidebar session row is exactly the requested width" {
     try std.testing.expect(std.mem.indexOf(u8, text, "work1234") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "x "));
 
-    // Selected rows are wrapped in inverse video; the highlight is
+    // Selected rows are given a dark background bar; the highlight is
     // the only selection marker.
     out.clearRetainingCapacity();
     try appendSessionRow(alloc, &out, entry, 24, true);
-    try std.testing.expect(std.mem.startsWith(u8, out.items, style_selected));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, style_row_selected));
     try std.testing.expect(std.mem.indexOf(u8, out.items, ">") == null);
 }
 
@@ -4277,11 +4283,11 @@ test "sidebar marks your-turn and unread sessions" {
     try std.testing.expectEqualStrings(expected_unread, out.items);
 
     // Selected: the marker's SGR reset must not drop the row highlight,
-    // so the inverse style is re-applied right after the marker.
+    // so the background style is re-applied right after the marker.
     out.clearRetainingCapacity();
     try appendSessionRow(alloc, &out, entry, 24, true);
-    const expected_sel = style_selected ++ style_attention ++ attention_marker ++
-        sgr_reset ++ style_selected ++ "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    const expected_sel = style_row_selected ++ style_attention ++ attention_marker ++
+        sgr_reset ++ style_row_selected ++ "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
     try std.testing.expectEqualStrings(expected_sel, out.items);
 }
 
