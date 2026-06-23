@@ -79,6 +79,23 @@ pub fn writeMsg(fd: std.posix.fd_t, msg_type: MsgType, payload: []const u8) !voi
     try writeAll(fd, payload);
 }
 
+/// Append a full frame (header + payload) to a growable buffer, for
+/// callers that queue output to flush later instead of writing it to a
+/// fd right away (e.g. a non-blocking socket with backpressure).
+pub fn appendMsg(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    msg_type: MsgType,
+    payload: []const u8,
+) !void {
+    std.debug.assert(payload.len <= max_payload);
+    var header: [header_len]u8 = undefined;
+    header[0] = @intFromEnum(msg_type);
+    std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
+    try list.appendSlice(alloc, &header);
+    try list.appendSlice(alloc, payload);
+}
+
 pub fn writeAll(fd: std.posix.fd_t, bytes: []const u8) !void {
     var i: usize = 0;
     while (i < bytes.len) i += try std.posix.write(fd, bytes[i..]);
