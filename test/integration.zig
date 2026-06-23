@@ -173,7 +173,100 @@ const Harness = struct {
             };
         }
     }
+
+    /// Poll `ls --json` until the session's "unread" flag equals want.
+    fn waitUnread(self: *Harness, session: []const u8, want: bool) !void {
+        var deadline = Deadline.init(default_timeout_ms);
+        while (true) {
+            const ls = try self.run(&.{ "ls", "--json" });
+            defer self.alloc.free(ls.stdout);
+            defer self.alloc.free(ls.stderr);
+            if (ls.term == .Exited and ls.term.Exited == 0) {
+                if (jsonUnread(self.alloc, ls.stdout, session)) |u| {
+                    if (u == want) return;
+                }
+            }
+            deadline.tick("unread flag never reached the wanted value") catch |err| {
+                std.debug.print("--- last ls --json ---\n{s}\n---\n", .{ls.stdout});
+                return err;
+            };
+        }
+    }
+
+    /// Poll `ls --json` until the session's bell ("your turn") presence
+    /// matches `want`: a bell is present when bell_idle_ms is >= 0.
+    fn waitBell(self: *Harness, session: []const u8, want: bool) !void {
+        var deadline = Deadline.init(default_timeout_ms);
+        while (true) {
+            const ls = try self.run(&.{ "ls", "--json" });
+            defer self.alloc.free(ls.stdout);
+            defer self.alloc.free(ls.stderr);
+            if (ls.term == .Exited and ls.term.Exited == 0) {
+                if (jsonBellIdle(self.alloc, ls.stdout, session)) |b| {
+                    if ((b >= 0) == want) return;
+                }
+            }
+            deadline.tick("bell flag never reached the wanted value") catch |err| {
+                std.debug.print("--- last ls --json ---\n{s}\n---\n", .{ls.stdout});
+                return err;
+            };
+        }
+    }
 };
+
+/// The "unread" flag for `session` in a `boo ls --json` array, or null
+/// when the session or field is absent or the JSON does not parse.
+fn jsonUnread(alloc: std.mem.Allocator, json: []const u8, session: []const u8) ?bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return null;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return null,
+    };
+    for (arr.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const name = switch (obj.get("name") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, name, session)) continue;
+        return switch (obj.get("unread") orelse return null) {
+            .bool => |b| b,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// The "bell_idle_ms" value for `session` in a `boo ls --json` array, or
+/// null when the session or field is absent or the JSON does not parse.
+fn jsonBellIdle(alloc: std.mem.Allocator, json: []const u8, session: []const u8) ?i64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return null;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return null,
+    };
+    for (arr.items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const name = switch (obj.get("name") orelse continue) {
+            .string => |s| s,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, name, session)) continue;
+        return switch (obj.get("bell_idle_ms") orelse return null) {
+            .integer => |n| n,
+            else => null,
+        };
+    }
+    return null;
+}
 
 const Deadline = struct {
     end: i64,
@@ -1030,7 +1123,91 @@ test "ls emits machine-readable JSON" {
         try std.testing.expectEqual(false, obj.get("attached").?.bool);
         try std.testing.expect(obj.get("idle_ms").?.integer >= 0);
         try std.testing.expectEqualStrings("cat", obj.get("title").?.string);
+        // A fresh cat session has produced no output, so nothing is unread.
+        try std.testing.expectEqual(false, obj.get("unread").?.bool);
+        // No bell has rung, so there is no "your turn".
+        try std.testing.expectEqual(@as(i64, -1), obj.get("bell_idle_ms").?.integer);
     }
+}
+
+test "ls --json reports unread output, and attaching clears it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A detached session that prints (what a coding agent does when it
+    // finishes a turn) then idles so the daemon stays alive.
+    try h.startDetached("unr", &.{ "sh", "-c", "printf 'agent-needs-you\\n'; sleep 60" });
+
+    // Output produced while detached flips unread on.
+    try h.waitUnread("unr", true);
+
+    // Attaching is viewing: the daemon clears unread on attach.
+    var client = try PtyClient.spawn(&h, &.{ "attach", "unr" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("agent-needs-you");
+    try h.waitUnread("unr", false);
+}
+
+test "ui: an unread session is marked in the sidebar" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Two sessions that print while detached, then idle. boo ui can
+    // auto-focus only one of them (clearing its unread), so the other
+    // is guaranteed to still be unread and carry the marker.
+    try h.startDetached("aaa", &.{ "sh", "-c", "printf 'hello\\n'; sleep 30" });
+    try h.startDetached("bbb", &.{ "sh", "-c", "printf 'hello\\n'; sleep 30" });
+    try h.waitUnread("aaa", true);
+    try h.waitUnread("bbb", true);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("aaa");
+    // The sidebar marks the unfocused unread session with the • glyph
+    // once the periodic refresh picks up the daemon's unread flag.
+    try ui.waitFor("\u{2022}");
+}
+
+test "ls --json flags a bell as your turn, and attaching clears it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A detached session that rings the bell (what an agent does to get
+    // your attention) then idles so the daemon stays alive.
+    try h.startDetached("bel", &.{ "sh", "-c", "printf 'ding\\a\\n'; sleep 60" });
+
+    // The bell among detached output flips "your turn" on, and a bell is
+    // output, so unread is set too.
+    try h.waitBell("bel", true);
+    try h.waitUnread("bel", true);
+
+    // Attaching is viewing: the daemon clears the bell on attach.
+    var client = try PtyClient.spawn(&h, &.{ "attach", "bel" }, 24, 80);
+    defer client.deinit();
+    try client.waitFor("ding");
+    try h.waitBell("bel", false);
+}
+
+test "ui: a session that rang the bell is marked your turn" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Two sessions ring the bell while detached, then idle. boo ui
+    // auto-focuses only one (clearing it), so the other keeps its ●.
+    try h.startDetached("aaa", &.{ "sh", "-c", "printf 'hi\\a\\n'; sleep 30" });
+    try h.startDetached("bbb", &.{ "sh", "-c", "printf 'hi\\a\\n'; sleep 30" });
+    try h.waitBell("aaa", true);
+    try h.waitBell("bbb", true);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("aaa");
+    // The unfocused belled session carries the ● your-turn glyph.
+    try ui.waitFor("\u{25CF}");
 }
 
 test "peek --json includes geometry, cursor, and screen content" {

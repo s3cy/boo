@@ -32,8 +32,12 @@ const windowpkg = @import("window.zig");
 
 const log = std.log.scoped(.ui);
 
-/// Refresh cadence for the sidebar's session list.
-const refresh_interval_ms: i64 = 1000;
+/// Poll cadence for the sidebar's session list. Only the focused
+/// session has a live socket; every other row's title, unread, and
+/// idle state is refreshed by re-polling on this interval (plus an
+/// immediate re-poll whenever the focused session changes its own
+/// title), so this bounds how stale a background row can look.
+const refresh_interval_ms: i64 = 250;
 /// Transient status messages stay visible this long.
 const message_ttl_ms: i64 = 4000;
 /// Render coalescing: at most one repaint per interval while output
@@ -841,6 +845,13 @@ pub const Entry = struct {
     name: []u8,
     attached: bool,
     idle_ms: i64,
+    /// Output arrived while this session was not being viewed: it has
+    /// activity you have not seen. Shown as a marker on the name row.
+    unread: bool = false,
+    /// Milliseconds since the last bell that rang while you were away,
+    /// or -1 for none. A bell is an explicit "your turn" request, shown
+    /// more prominently than plain unread.
+    bell_idle_ms: i64 = -1,
     /// Owned by the list; control bytes are stripped by the daemon
     /// but the title may contain any UTF-8 text.
     title: []u8,
@@ -857,8 +868,21 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
 // -- Sidebar rendering --------------------------------------------------------
 
 const sgr_reset = "\x1b[0m";
+/// Reverse video, used to highlight an in-progress mouse text selection
+/// over viewport content.
 const style_selected = "\x1b[7m";
+/// Dark gray background for the selected sidebar row. A gentle bar
+/// rather than reverse video, whose bright inverted block washes out
+/// the dim title row beneath the name.
+const style_row_selected = "\x1b[48;5;238m";
 const style_dim = "\x1b[2m";
+/// Bold blue: the "your turn" marker, a bell that rang while you were
+/// away.
+const style_attention = "\x1b[1;34m";
+/// Status glyph for a session whose output you have not viewed.
+const unread_marker = "\u{2022}"; // •
+/// Status glyph for "your turn": a bell rang while you were away.
+const attention_marker = "\u{25CF}"; // ●
 
 /// Display width in terminal columns of one codepoint: 0 for
 /// combining and other zero-width marks, 2 for East Asian wide and
@@ -973,7 +997,7 @@ fn appendClipped(
 
 /// One sidebar session name row: attached marker, name, and a kill
 /// target in the last column. Exactly `width` display columns plus
-/// SGR codes; the inverse-video highlight alone marks the selected
+/// SGR codes; the background highlight alone marks the selected
 /// session.
 pub fn appendSessionRow(
     alloc: std.mem.Allocator,
@@ -983,12 +1007,31 @@ pub fn appendSessionRow(
     selected: bool,
 ) !void {
     if (width == 0) return;
-    if (selected) try out.appendSlice(alloc, style_selected);
+    if (selected) try out.appendSlice(alloc, style_row_selected);
 
-    // '*': attached by another client. The selected session is
-    // attached by this UI itself, which is not worth a marker.
-    const marker: u8 = if (!selected and entry.attached) '*' else ' ';
-    try out.append(alloc, marker);
+    // The leading status column, always exactly one display cell:
+    //   ●  your turn: a bell rang while you were away. Bold blue.
+    //   •  unread output you have not viewed. Dim.
+    //   *  attached by another client.
+    //   (space)  nothing to flag. The selected session is attached by
+    //      this ui itself, which is not worth a '*'.
+    // A bell is an explicit request for you, so it outranks plain
+    // unread, which outranks who is holding the session.
+    if (entry.bell_idle_ms >= 0) {
+        try out.appendSlice(alloc, style_attention);
+        try out.appendSlice(alloc, attention_marker);
+        try out.appendSlice(alloc, sgr_reset);
+        // Restore the row highlight the marker's reset cleared.
+        if (selected) try out.appendSlice(alloc, style_row_selected);
+    } else if (entry.unread) {
+        try out.appendSlice(alloc, style_dim);
+        try out.appendSlice(alloc, unread_marker);
+        try out.appendSlice(alloc, sgr_reset);
+        if (selected) try out.appendSlice(alloc, style_row_selected);
+    } else {
+        const marker: u8 = if (!selected and entry.attached) '*' else ' ';
+        try out.append(alloc, marker);
+    }
 
     if (width >= 12) {
         // "<m><name...> x ": kill target in the last columns.
@@ -1011,7 +1054,7 @@ pub fn appendSessionTitleRow(
     selected: bool,
 ) !void {
     if (width == 0) return;
-    if (selected) try out.appendSlice(alloc, style_selected);
+    if (selected) try out.appendSlice(alloc, style_row_selected);
     try out.appendSlice(alloc, style_dim);
 
     if (entry.title.len > 0 and width > 2) {
@@ -2120,6 +2163,8 @@ const Ui = struct {
                 .name = try self.alloc.dupe(u8, name),
                 .attached = info.attached,
                 .idle_ms = info.idle_ms,
+                .unread = info.unread,
+                .bell_idle_ms = info.bell_idle_ms,
                 .title = try self.alloc.dupe(u8, info.title),
             });
         }
@@ -4193,12 +4238,57 @@ test "sidebar session row is exactly the requested width" {
     try std.testing.expect(std.mem.indexOf(u8, text, "work1234") != null);
     try std.testing.expect(std.mem.endsWith(u8, text, "x "));
 
-    // Selected rows are wrapped in inverse video; the highlight is
+    // Selected rows are given a dark background bar; the highlight is
     // the only selection marker.
     out.clearRetainingCapacity();
     try appendSessionRow(alloc, &out, entry, 24, true);
-    try std.testing.expect(std.mem.startsWith(u8, out.items, style_selected));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, style_row_selected));
     try std.testing.expect(std.mem.indexOf(u8, out.items, ">") == null);
+}
+
+test "sidebar marks your-turn and unread sessions" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var name_buf: [8]u8 = "work1234".*;
+    var title_buf: [0]u8 = .{};
+    // Attached elsewhere AND a bell rang while away at once, to prove
+    // the bell ("your turn") outranks both plain unread and the '*'.
+    const entry: Entry = .{
+        .name = &name_buf,
+        .attached = true,
+        .idle_ms = 0,
+        .unread = true,
+        .bell_idle_ms = 0,
+        .title = &title_buf,
+    };
+
+    // The marker is one display cell (the ● glyph), so the row is still
+    // exactly 24 columns: 1 marker + 20 name + 3 " x ".
+    try appendSessionRow(alloc, &out, entry, 24, false);
+    const expected = style_attention ++ attention_marker ++ sgr_reset ++
+        "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    try std.testing.expectEqualStrings(expected, out.items);
+    // The bell marker takes priority over the attached-elsewhere '*'.
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.items, '*') == null);
+
+    // Unread with no bell is the dim • marker.
+    out.clearRetainingCapacity();
+    var unread_only = entry;
+    unread_only.bell_idle_ms = -1;
+    try appendSessionRow(alloc, &out, unread_only, 24, false);
+    const expected_unread = style_dim ++ unread_marker ++ sgr_reset ++
+        "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    try std.testing.expectEqualStrings(expected_unread, out.items);
+
+    // Selected: the marker's SGR reset must not drop the row highlight,
+    // so the background style is re-applied right after the marker.
+    out.clearRetainingCapacity();
+    try appendSessionRow(alloc, &out, entry, 24, true);
+    const expected_sel = style_row_selected ++ style_attention ++ attention_marker ++
+        sgr_reset ++ style_row_selected ++ "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    try std.testing.expectEqualStrings(expected_sel, out.items);
 }
 
 test "sidebar title row renders the title dim under the name" {
