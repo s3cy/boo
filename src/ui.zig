@@ -841,6 +841,13 @@ pub const Entry = struct {
     name: []u8,
     attached: bool,
     idle_ms: i64,
+    /// Output arrived while this session was not being viewed: it has
+    /// activity you have not seen. Shown as a marker on the name row.
+    unread: bool = false,
+    /// The session's output has settled (quiet for idle_settle_ms). An
+    /// unread session that is idle is waiting on you; one still
+    /// producing output is working.
+    idle: bool = false,
     /// Owned by the list; control bytes are stripped by the daemon
     /// but the title may contain any UTF-8 text.
     title: []u8,
@@ -859,6 +866,11 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
 const sgr_reset = "\x1b[0m";
 const style_selected = "\x1b[7m";
 const style_dim = "\x1b[2m";
+/// Bold yellow: unread output that has settled, the "your turn" marker
+/// on a session row.
+const style_attention = "\x1b[1;33m";
+/// The one-column glyph marking a session with unread output.
+const unread_marker = "\u{25CF}"; // ●
 
 /// Display width in terminal columns of one codepoint: 0 for
 /// combining and other zero-width marks, 2 for East Asian wide and
@@ -985,10 +997,25 @@ pub fn appendSessionRow(
     if (width == 0) return;
     if (selected) try out.appendSlice(alloc, style_selected);
 
-    // '*': attached by another client. The selected session is
-    // attached by this UI itself, which is not worth a marker.
-    const marker: u8 = if (!selected and entry.attached) '*' else ' ';
-    try out.append(alloc, marker);
+    // The leading status column, always exactly one display cell:
+    //   ●  unread output you have not viewed. Bold yellow once the
+    //      session has gone idle (its output settled, so it is waiting
+    //      on you), dim while it is still producing output.
+    //   *  attached by another client.
+    //   (space)  nothing to flag. The selected session is attached by
+    //      this ui itself, which is not worth a '*'.
+    // Unread takes priority: a session with output you have not seen
+    // matters more than who is holding it.
+    if (entry.unread) {
+        try out.appendSlice(alloc, if (entry.idle) style_attention else style_dim);
+        try out.appendSlice(alloc, unread_marker);
+        try out.appendSlice(alloc, sgr_reset);
+        // Restore the row highlight the marker's reset cleared.
+        if (selected) try out.appendSlice(alloc, style_selected);
+    } else {
+        const marker: u8 = if (!selected and entry.attached) '*' else ' ';
+        try out.append(alloc, marker);
+    }
 
     if (width >= 12) {
         // "<m><name...> x ": kill target in the last columns.
@@ -2120,6 +2147,8 @@ const Ui = struct {
                 .name = try self.alloc.dupe(u8, name),
                 .attached = info.attached,
                 .idle_ms = info.idle_ms,
+                .unread = info.unread,
+                .idle = info.out_idle_ms >= main.idle_settle_ms,
                 .title = try self.alloc.dupe(u8, info.title),
             });
         }
@@ -4199,6 +4228,51 @@ test "sidebar session row is exactly the requested width" {
     try appendSessionRow(alloc, &out, entry, 24, true);
     try std.testing.expect(std.mem.startsWith(u8, out.items, style_selected));
     try std.testing.expect(std.mem.indexOf(u8, out.items, ">") == null);
+}
+
+test "sidebar marks a session with unread output" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var name_buf: [8]u8 = "work1234".*;
+    var title_buf: [0]u8 = .{};
+    // Attached elsewhere AND unread+idle at once, to prove unread wins
+    // and that idle selects the bold-yellow "your turn" style.
+    const entry: Entry = .{
+        .name = &name_buf,
+        .attached = true,
+        .idle_ms = 0,
+        .unread = true,
+        .idle = true,
+        .title = &title_buf,
+    };
+
+    // The marker is one display cell (the ● glyph), so the row is still
+    // exactly 24 columns: 1 marker + 20 name + 3 " x ".
+    try appendSessionRow(alloc, &out, entry, 24, false);
+    const expected = style_attention ++ unread_marker ++ sgr_reset ++
+        "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    try std.testing.expectEqualStrings(expected, out.items);
+    // Unread takes priority over the attached-elsewhere '*' marker.
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.items, '*') == null);
+
+    // Unread but still producing output (not idle) is the dim marker.
+    out.clearRetainingCapacity();
+    var working = entry;
+    working.idle = false;
+    try appendSessionRow(alloc, &out, working, 24, false);
+    const expected_working = style_dim ++ unread_marker ++ sgr_reset ++
+        "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    try std.testing.expectEqualStrings(expected_working, out.items);
+
+    // Selected: the marker's SGR reset must not drop the row highlight,
+    // so the inverse style is re-applied right after the marker.
+    out.clearRetainingCapacity();
+    try appendSessionRow(alloc, &out, entry, 24, true);
+    const expected_sel = style_selected ++ style_attention ++ unread_marker ++
+        sgr_reset ++ style_selected ++ "work1234" ++ (" " ** 12) ++ " x " ++ sgr_reset;
+    try std.testing.expectEqualStrings(expected_sel, out.items);
 }
 
 test "sidebar title row renders the title dim under the name" {

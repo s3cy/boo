@@ -125,6 +125,13 @@ pub const commands = [_]Entry{
         \\session runs in a viewport on the right, rendered live from
         \\terminal state.
         \\
+        \\sidebar markers (left of the name):
+        \\  ●  unread output you have not viewed. Bold yellow once the
+        \\     session's output settles (it is waiting on you), dim
+        \\     while it is still producing output. Clears when you focus
+        \\     the session.
+        \\  *  attached by another client
+        \\
         \\mouse:
         \\  click a session     focus it (steals politely, like attach)
         \\  click its 'x'       kill it (asks for confirmation)
@@ -181,7 +188,8 @@ pub const commands = [_]Entry{
         \\
         \\flags:
         \\  --json  emit a JSON array:
-        \\          [{"name","attached","idle_ms","title"}]
+        \\          [{"name","attached","idle_ms","unread","title"}]
+        \\          ("unread" flags output you have not viewed)
         \\
         ,
     },
@@ -358,7 +366,8 @@ pub const topics = [_]Entry{
         \\  control keys; stdin mode is binary safe.
         \\
         \\machine-readable output:
-        \\  boo ls --json    [{"name","attached","idle_ms","title"}]
+        \\  boo ls --json    [{"name","attached","idle_ms","unread",
+        \\                    "title"}]
         \\  boo peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\

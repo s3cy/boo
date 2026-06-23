@@ -78,6 +78,10 @@ pub const Daemon = struct {
     /// or client input; reported as session idle time.
     last_activity_ms: i64 = 0,
 
+    /// Output arrived while no client was attached: the session has
+    /// activity you have not seen. The ui flags it; attaching clears it.
+    unread: bool = false,
+
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
 
@@ -262,6 +266,9 @@ pub const Daemon = struct {
                     }
                 }
                 conn.attached = true;
+                // Attaching is viewing, so the session's output is no
+                // longer unseen.
+                self.unread = false;
                 self.key_parser = .{};
                 self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
@@ -403,11 +410,12 @@ pub const Daemon = struct {
                 0;
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.alloc);
-            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t", .{
+            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t{d}\t", .{
                 self.opts.name,
                 if (attached) "Attached" else "Detached",
                 idle,
                 out_idle,
+                @intFromBool(self.unread),
             });
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.
@@ -517,6 +525,10 @@ pub const Daemon = struct {
         const now = std.time.milliTimestamp();
         win.last_output_ms = now;
         self.last_activity_ms = now;
+        // Output produced while nothing is attached marks the session
+        // unread, so the ui can flag activity since you last looked.
+        // Attaching clears it.
+        if (self.attachedConn() == null) self.unread = true;
 
         const conn = (if (win.passthrough) self.attachedConn() else null) orelse {
             // Not passed through: the window answers queries itself.
