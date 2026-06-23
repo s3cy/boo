@@ -20,6 +20,13 @@ pub const Window = struct {
     child_pid: posix.pid_t,
     dead: bool = false,
 
+    /// The child rang the terminal bell since the daemon last serviced
+    /// this window. The parser sets this only on a real BEL, never on
+    /// the BEL that terminates an OSC string (so a title update cannot
+    /// trip it). The daemon reads and clears the latch each service
+    /// cycle.
+    bell: bool = false,
+
     /// Fallback title: the command that was launched.
     command_title: []const u8,
 
@@ -89,7 +96,7 @@ pub const Window = struct {
         var handler: Stream.Handler = .init(&self.term);
         handler.effects = .{
             .write_pty = effectWritePty,
-            .bell = null,
+            .bell = effectBell,
             .color_scheme = null,
             .device_attributes = effectDeviceAttributes,
             .enquiry = null,
@@ -143,6 +150,10 @@ pub const Window = struct {
         );
         const Fn = @typeInfo(field.type).optional.child;
         return @typeInfo(@typeInfo(Fn).pointer.child).@"fn".return_type.?;
+    }
+
+    fn effectBell(handler: *Stream.Handler) void {
+        fromHandler(handler).bell = true;
     }
 
     fn effectDeviceAttributes(handler: *Stream.Handler) DeviceAttributes {

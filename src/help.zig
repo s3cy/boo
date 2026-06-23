@@ -126,10 +126,10 @@ pub const commands = [_]Entry{
         \\terminal state.
         \\
         \\sidebar markers (left of the name):
-        \\  •  unread output you have not viewed. Bold blue once the
-        \\     session's output settles (it is waiting on you), dim
-        \\     while it is still producing output. Clears when you focus
-        \\     the session.
+        \\  ●  your turn: a bell rang while you were away (e.g. an agent
+        \\     finished its turn). Bold blue. Clears when you focus it.
+        \\  •  unread output you have not viewed, dim. Clears when you
+        \\     focus the session.
         \\  *  attached by another client
         \\
         \\mouse:
@@ -188,8 +188,10 @@ pub const commands = [_]Entry{
         \\
         \\flags:
         \\  --json  emit a JSON array:
-        \\          [{"name","attached","idle_ms","unread","title"}]
-        \\          ("unread" flags output you have not viewed)
+        \\          [{"name","attached","idle_ms","unread",
+        \\            "bell_idle_ms","title"}]
+        \\          ("unread" flags unseen output; "bell_idle_ms" is the
+        \\           age of a bell rung while away, -1 if none)
         \\
         ,
     },
@@ -367,7 +369,7 @@ pub const topics = [_]Entry{
         \\
         \\machine-readable output:
         \\  boo ls --json    [{"name","attached","idle_ms","unread",
-        \\                    "title"}]
+        \\                    "bell_idle_ms","title"}]
         \\  boo peek --json  {"session","title","rows","cols",
         \\                    "cursor":{"row","col"},"screen"}
         \\

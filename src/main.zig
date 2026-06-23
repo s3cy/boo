@@ -159,7 +159,7 @@ fn resolveSession(
 
 pub const SessionInfo = struct {
     /// Full info payload:
-    /// name \t Attached|Detached \t idle_ms \t out_idle_ms \t unread \t title.
+    /// name \t Attached|Detached \t idle_ms \t out_idle_ms \t unread \t bell_idle_ms \t title.
     text: []u8,
     attached: bool,
     idle_ms: i64,
@@ -168,6 +168,10 @@ pub const SessionInfo = struct {
     /// Output arrived while no client was attached. Defaults false
     /// against an older daemon whose info reply predates the field.
     unread: bool,
+    /// Milliseconds since the last bell that rang while you were away,
+    /// or -1 for none. A bell is an explicit "your turn" request.
+    /// Defaults -1 against a daemon predating the field.
+    bell_idle_ms: i64,
     /// Window title; slices into `text`.
     title: []const u8,
 };
@@ -191,16 +195,24 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) 
         return error.BadResponse;
     const out_idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
         return error.BadResponse;
-    // The remainder is either `unread \t title` (current daemon) or just
-    // `title` (a daemon predating the field). The title is tab-free, so a
-    // tab in the remainder unambiguously separates the unread flag from
-    // the title; without one it is all title and unread defaults false.
+    // The remainder is `unread \t bell_idle_ms \t title` on a current
+    // daemon, `unread \t title` on one predating the bell field, or just
+    // `title` on one predating both. The title is tab-free, so leading
+    // fields peel off the front and the tab-free tail is the title;
+    // missing fields take their defaults (unread false, no bell).
     const rest = it.rest();
     var unread = false;
+    var bell_idle_ms: i64 = -1;
     var title = rest;
-    if (std.mem.indexOfScalar(u8, rest, '\t')) |tab| {
-        unread = std.mem.eql(u8, rest[0..tab], "1");
-        title = rest[tab + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, '\t')) |t1| {
+        unread = std.mem.eql(u8, rest[0..t1], "1");
+        const after = rest[t1 + 1 ..];
+        if (std.mem.indexOfScalar(u8, after, '\t')) |t2| {
+            bell_idle_ms = std.fmt.parseInt(i64, after[0..t2], 10) catch -1;
+            title = after[t2 + 1 ..];
+        } else {
+            title = after;
+        }
     }
     return .{
         .text = result.text,
@@ -208,6 +220,7 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) 
         .idle_ms = idle_ms,
         .out_idle_ms = out_idle_ms,
         .unread = unread,
+        .bell_idle_ms = bell_idle_ms,
         .title = title,
     };
 }
@@ -451,10 +464,11 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             if (i > 0) try out.append(alloc, ',');
             try out.appendSlice(alloc, "{\"name\":");
             try appendJsonString(alloc, &out, entry.name);
-            const tail = try std.fmt.allocPrint(alloc, ",\"attached\":{},\"idle_ms\":{d},\"unread\":{},\"title\":", .{
+            const tail = try std.fmt.allocPrint(alloc, ",\"attached\":{},\"idle_ms\":{d},\"unread\":{},\"bell_idle_ms\":{d},\"title\":", .{
                 entry.info.attached,
                 entry.info.idle_ms,
                 entry.info.unread,
+                entry.info.bell_idle_ms,
             });
             defer alloc.free(tail);
             try out.appendSlice(alloc, tail);
@@ -703,9 +717,8 @@ fn cmdPeek(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     try stdoutWrite(out.items);
 }
 
-/// How long output must stay quiet for `wait --idle` to fire, and for a
-/// session to count as idle in the ui.
-pub const idle_settle_ms: i64 = 2000;
+/// How long output must stay quiet for `wait --idle` to fire.
+const idle_settle_ms: i64 = 2000;
 
 fn cmdWait(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name_arg: ?[]const u8 = null;

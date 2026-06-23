@@ -82,6 +82,13 @@ pub const Daemon = struct {
     /// activity you have not seen. The ui flags it; attaching clears it.
     unread: bool = false,
 
+    /// Wall-clock time (milliseconds) of the last bell that rang while
+    /// no client was attached, or 0 for none since you last looked. A
+    /// bell is an explicit "your turn" request; the info reply reports
+    /// it as an age so the ui can combine it with output idle time.
+    /// Attaching clears it.
+    last_bell_ms: i64 = 0,
+
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
 
@@ -269,6 +276,7 @@ pub const Daemon = struct {
                 // Attaching is viewing, so the session's output is no
                 // longer unseen.
                 self.unread = false;
+                self.last_bell_ms = 0;
                 self.key_parser = .{};
                 self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
@@ -408,14 +416,22 @@ pub const Daemon = struct {
                 @max(0, now - w.last_output_ms)
             else
                 0;
+            // Age of the last bell that rang while you were away, or -1
+            // for none. Reported against the same `now` as out_idle so
+            // the ui can compare the two.
+            const bell_idle: i64 = if (self.last_bell_ms != 0)
+                @max(0, now - self.last_bell_ms)
+            else
+                -1;
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.alloc);
-            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t{d}\t", .{
+            try out.print(self.alloc, "{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t", .{
                 self.opts.name,
                 if (attached) "Attached" else "Detached",
                 idle,
                 out_idle,
                 @intFromBool(self.unread),
+                bell_idle,
             });
             // Window title last; sanitized, so it cannot contain the
             // tabs that separate the fields.
@@ -528,11 +544,13 @@ pub const Daemon = struct {
         // Output produced while nothing is attached marks the session
         // unread, so the ui can flag activity since you last looked.
         // Attaching clears it.
-        if (self.attachedConn() == null) self.unread = true;
+        const detached = self.attachedConn() == null;
+        if (detached) self.unread = true;
 
         const conn = (if (win.passthrough) self.attachedConn() else null) orelse {
             // Not passed through: the window answers queries itself.
             win.feed(chunk);
+            self.noteBell(win, detached, now);
             return;
         };
 
@@ -557,6 +575,7 @@ pub const Daemon = struct {
         const split = result.discard_start orelse chunk.len;
         win.feed(chunk[0..split]);
         if (split < chunk.len) win.feedDiscarded(chunk[split..]);
+        self.noteBell(win, detached, now);
 
         const filtered = writer.buffered();
         if (filtered.len > 0) conn.send(.output, filtered);
@@ -568,6 +587,16 @@ pub const Daemon = struct {
                 log.warn("repaint after screen change failed: {}", .{err});
             };
         }
+    }
+
+    /// Consume the window's bell latch. A bell that rang while no client
+    /// was attached records the time as an explicit "your turn" signal;
+    /// a bell seen while attached already reached the client's terminal,
+    /// so it is only cleared.
+    fn noteBell(self: *Daemon, win: *Window, detached: bool, now: i64) void {
+        if (!win.bell) return;
+        win.bell = false;
+        if (detached) self.last_bell_ms = now;
     }
 
     /// Remove closed conns. Runs after every poll dispatch so
