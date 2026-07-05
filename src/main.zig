@@ -1128,6 +1128,7 @@ test {
     _ = @import("cwd.zig");
     _ = @import("keys.zig");
     _ = @import("pty.zig");
+    _ = @import("reap.zig");
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
     _ = @import("osc52.zig");
