@@ -20,6 +20,7 @@ const keys = @import("keys.zig");
 const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
 const cwd = @import("cwd.zig");
+const reap = @import("reap.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
 const main = @import("main.zig");
@@ -587,11 +588,17 @@ pub const Daemon = struct {
             // connecting to the dying daemon and reading EOF.
             self.retireListener();
             conn.send(.ok, "");
-            if (self.win) |w| {
-                posix.kill(w.child_pid, posix.SIG.HUP) catch {};
-            }
+            // Tell attached clients the session ended and flush those
+            // notices (and the ack above) before the teardown, so the
+            // kill returns and clients learn the outcome without waiting
+            // on a stubborn descendant's grace period.
             self.broadcastExit("session terminated");
-            self.quitting = true;
+            self.drainOutbound();
+            // End the whole tree the session started, not just the shell,
+            // so a grandchild that ignores the hangup or escaped into its
+            // own process group cannot outlive the session and keep its
+            // resources (the bug in issue #97).
+            if (self.win) |w| reap.terminateTree(self.alloc, w.child_pid);
         } else {
             conn.send(.err, "unknown command");
         }

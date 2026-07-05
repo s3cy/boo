@@ -482,6 +482,20 @@ fn waitFileEquals(alloc: std.mem.Allocator, path: []const u8, expected: []const 
     }
 }
 
+/// Poll `path` until it holds a pid, then return it. Fails on timeout.
+fn waitPidFile(alloc: std.mem.Allocator, path: []const u8) !posix.pid_t {
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        const content = std.fs.cwd().readFileAlloc(alloc, path, 64) catch "";
+        defer if (content.len > 0) alloc.free(content);
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (std.fmt.parseInt(posix.pid_t, trimmed, 10)) |pid| return pid else |_| {}
+        }
+        try deadline.tick("survivor pid file never appeared");
+    }
+}
+
 test "detached session: send and peek round-trip through libghostty" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -1309,6 +1323,63 @@ test "kill --all banishes every session" {
         try deadline.tick("sessions survived kill --all");
     }
     try h.runExit(&.{ "peek", "ghost1" }, 3);
+}
+
+test "kill tears down the whole process tree, not just the session shell" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A survivor that escapes a shell-only hangup: it ignores SIGHUP and
+    // SIGTERM and loops, so only a full-tree SIGKILL escalation can end
+    // it. It records its pid so the test can follow it across the kill.
+    const pid_path = try std.fmt.allocPrint(alloc, "{s}/survivor.pid", .{h.dir});
+    defer alloc.free(pid_path);
+    const script_path = try std.fmt.allocPrint(alloc, "{s}/survivor.sh", .{h.dir});
+    defer alloc.free(script_path);
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "#!/bin/sh\necho $$ > {s}\ntrap '' HUP TERM\nwhile :; do sleep 1; done\n",
+        .{pid_path},
+    );
+    defer alloc.free(body);
+    try std.fs.cwd().writeFile(.{ .sub_path = script_path, .data = body });
+    try posix.fchmodat(posix.AT.FDCWD, script_path, 0o755, 0);
+
+    try h.startDetached("orph", &.{"sh"});
+
+    // Launch the survivor as a grandchild of the session shell through an
+    // intermediate shell that stays alive (wait), so at kill time the
+    // survivor is still a descendant of the session shell rather than a
+    // process that already reparented to init.
+    const launch = try std.fmt.allocPrint(alloc, "sh -c '{s} & wait' &", .{script_path});
+    defer alloc.free(launch);
+    try h.sendLine("orph", launch);
+
+    // Wait until the survivor is up, then read its pid.
+    const survivor_pid = try waitPidFile(alloc, pid_path);
+    // Safety net: never leak the survivor if the test bails out early.
+    defer posix.kill(survivor_pid, posix.SIG.KILL) catch {};
+
+    // It is really alive before the kill.
+    try posix.kill(survivor_pid, 0);
+
+    try h.runOk(&.{ "kill", "orph" });
+
+    // The session is gone...
+    try h.runExit(&.{ "peek", "orph" }, 3);
+
+    // ...and so is the whole tree it started: the orphan is torn down
+    // rather than left holding its resources. The shell-only SIGHUP of
+    // the old behavior left this process alive.
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        posix.kill(survivor_pid, 0) catch break; // ESRCH: the orphan is gone
+        deadline.tick("orphaned descendant survived kill") catch |err| {
+            std.debug.print("survivor pid {d} still alive after kill\n", .{survivor_pid});
+            return err;
+        };
+    }
 }
 
 test "exit codes distinguish usage, missing sessions, and ambiguity" {
