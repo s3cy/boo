@@ -35,11 +35,19 @@ const Proc = struct {
     start: u64,
 };
 
+/// One process seen while enumerating the whole process table, used to
+/// rebuild the descendant tree by walking parent links.
+const Entry = struct {
+    pid: posix.pid_t,
+    ppid: posix.pid_t,
+    start: u64,
+};
+
 /// Sentinel for "start time unavailable". A real start time is normalized
 /// away from this value (see normalizeStart).
 const start_unknown: u64 = 0;
 
-/// Upper bound on descendants enumerated, so a fork bomb cannot make
+/// Upper bound on processes enumerated, so a fork bomb cannot make
 /// teardown allocate or scan without limit.
 const max_procs: usize = 16 * 1024;
 
@@ -123,16 +131,64 @@ fn signalProc(p: Proc, sig: u8) void {
 /// leader itself. The leader is always present so at least the shell is
 /// torn down, even when enumeration fails or the platform is unsupported.
 fn collect(alloc: std.mem.Allocator, leader: posix.pid_t, out: *std.ArrayList(Proc)) void {
-    switch (builtin.os.tag) {
-        .linux => collectLinux(alloc, leader, out) catch {},
-        .macos, .ios, .tvos, .watchos, .visionos => collectDarwin(alloc, leader, out) catch {},
-        else => {},
-    }
+    var all: std.ArrayList(Entry) = .empty;
+    defer all.deinit(alloc);
+    enumerateAll(alloc, &all) catch {};
+    buildTree(alloc, leader, all.items, out) catch {};
+
     for (out.items) |p| if (p.pid == leader) return;
     out.append(alloc, .{
         .pid = leader,
         .start = startTimeIfAlive(leader) orelse start_unknown,
     }) catch {};
+}
+
+/// Collect the transitive descendants of `leader` from a full process
+/// snapshot: a process is in the tree when its parent is. Iterated to a
+/// fixpoint because a process record only points up (to its parent).
+fn buildTree(
+    alloc: std.mem.Allocator,
+    leader: posix.pid_t,
+    all: []const Entry,
+    out: *std.ArrayList(Proc),
+) !void {
+    var member: std.AutoHashMapUnmanaged(posix.pid_t, u64) = .empty;
+    defer member.deinit(alloc);
+
+    var leader_start: u64 = startTimeIfAlive(leader) orelse start_unknown;
+    for (all) |e| if (e.pid == leader) {
+        leader_start = e.start;
+        break;
+    };
+    try member.put(alloc, leader, leader_start);
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (all) |e| {
+            if (member.contains(e.pid)) continue;
+            // A process is never its own parent; guard against a self-loop
+            // (pid 1) that would otherwise spin the fixpoint.
+            if (e.pid == e.ppid) continue;
+            if (member.contains(e.ppid)) {
+                try member.put(alloc, e.pid, e.start);
+                changed = true;
+            }
+        }
+    }
+
+    var it = member.iterator();
+    while (it.next()) |e| {
+        try out.append(alloc, .{ .pid = e.key_ptr.*, .start = e.value_ptr.* });
+    }
+}
+
+fn enumerateAll(alloc: std.mem.Allocator, all: *std.ArrayList(Entry)) !void {
+    switch (builtin.os.tag) {
+        .linux => try enumerateLinux(alloc, all),
+        .macos, .ios, .tvos, .watchos, .visionos => try enumerateDarwin(alloc, all),
+        else => {},
+    }
 }
 
 /// The process start time if `pid` names a live, non-zombie process, else
@@ -150,19 +206,19 @@ fn startTimeIfAlive(pid: posix.pid_t) ?u64 {
     }
 }
 
+/// Map a real start time of 0 to 1 so it never collides with the
+/// start_unknown sentinel. A start time of 0 is not observed for the
+/// processes a session spawns.
+fn normalizeStart(s: u64) u64 {
+    return if (s == start_unknown) 1 else s;
+}
+
 // -- Linux ----------------------------------------------------------------
 
 const Stat = struct { ppid: posix.pid_t, state: u8, start: u64 };
 
-/// Enumerate every process via /proc, then collect the transitive
-/// descendants of `leader` by walking parent links to a fixpoint. The tree
-/// must be built from a full snapshot because a child's /proc entry only
-/// points up (to its parent), never down.
-fn collectLinux(alloc: std.mem.Allocator, leader: posix.pid_t, out: *std.ArrayList(Proc)) !void {
-    const Entry = struct { pid: posix.pid_t, ppid: posix.pid_t, start: u64 };
-    var all: std.ArrayList(Entry) = .empty;
-    defer all.deinit(alloc);
-
+/// Enumerate every process from /proc.
+fn enumerateLinux(alloc: std.mem.Allocator, all: *std.ArrayList(Entry)) !void {
     var dir = try std.fs.openDirAbsolute("/proc", .{ .iterate = true });
     defer dir.close();
     var it = dir.iterate();
@@ -173,28 +229,6 @@ fn collectLinux(alloc: std.mem.Allocator, leader: posix.pid_t, out: *std.ArrayLi
         const st = readLinuxStat(pid) orelse continue;
         try all.append(alloc, .{ .pid = pid, .ppid = st.ppid, .start = st.start });
         if (all.items.len >= max_procs) break;
-    }
-
-    // A process is in the tree when its parent is. Iterate until no new
-    // members appear.
-    var member: std.AutoHashMapUnmanaged(posix.pid_t, u64) = .empty;
-    defer member.deinit(alloc);
-    try member.put(alloc, leader, startTimeIfAlive(leader) orelse start_unknown);
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (all.items) |e| {
-            if (member.contains(e.pid)) continue;
-            if (member.contains(e.ppid)) {
-                try member.put(alloc, e.pid, e.start);
-                changed = true;
-            }
-        }
-    }
-
-    var mit = member.iterator();
-    while (mit.next()) |e| {
-        try out.append(alloc, .{ .pid = e.key_ptr.*, .start = e.value_ptr.* });
     }
 }
 
@@ -238,44 +272,29 @@ fn readFileZ(path: [*:0]const u8, buf: []u8) ?[]u8 {
     return buf[0..total];
 }
 
-/// Map a real start time of 0 to 1 so it never collides with the
-/// start_unknown sentinel. A start time of 0 is not observed for the
-/// processes a session spawns.
-fn normalizeStart(s: u64) u64 {
-    return if (s == start_unknown) 1 else s;
-}
-
 // -- macOS ----------------------------------------------------------------
 
-/// BFS the descendant tree via proc_listchildpids, which (unlike /proc)
-/// enumerates a process's children directly.
-fn collectDarwin(alloc: std.mem.Allocator, leader: posix.pid_t, out: *std.ArrayList(Proc)) !void {
-    var seen: std.AutoHashMapUnmanaged(posix.pid_t, void) = .empty;
-    defer seen.deinit(alloc);
-    var queue: std.ArrayList(posix.pid_t) = .empty;
-    defer queue.deinit(alloc);
+/// Enumerate every process the caller can inspect via libproc. proc_pidinfo
+/// yields both the parent pid and the start time, so the shared fixpoint in
+/// buildTree can rebuild the descendant tree exactly as on Linux.
+fn enumerateDarwin(alloc: std.mem.Allocator, all: *std.ArrayList(Entry)) !void {
+    const pids = try alloc.alloc(c_int, max_procs);
+    defer alloc.free(pids);
 
-    try seen.put(alloc, leader, {});
-    try out.append(alloc, .{ .pid = leader, .start = startTimeIfAlive(leader) orelse start_unknown });
-    try queue.append(alloc, leader);
-
-    var kids: [1024]c_int = undefined;
-    var head: usize = 0;
-    while (head < queue.items.len) : (head += 1) {
-        const parent = queue.items[head];
-        const bytes = darwin.proc_listchildpids(parent, &kids, @sizeOf(@TypeOf(kids)));
-        if (bytes <= 0) continue;
-        const count = @min(@as(usize, @intCast(bytes)) / @sizeOf(c_int), kids.len);
-        for (kids[0..count]) |child_c| {
-            if (child_c <= 0) continue;
-            const child: posix.pid_t = @intCast(child_c);
-            if (seen.contains(child)) continue;
-            try seen.put(alloc, child, {});
-            const start = startTimeIfAlive(child) orelse continue; // already gone
-            try out.append(alloc, .{ .pid = child, .start = start });
-            if (out.items.len >= max_procs) return;
-            try queue.append(alloc, child);
-        }
+    // proc_listallpids returns the number of pids written, not a byte
+    // count.
+    const count = darwin.proc_listallpids(pids.ptr, @intCast(pids.len * @sizeOf(c_int)));
+    if (count <= 0) return;
+    const n = @min(@as(usize, @intCast(count)), pids.len);
+    for (pids[0..n]) |pid_c| {
+        if (pid_c <= 0) continue;
+        const pid: posix.pid_t = @intCast(pid_c);
+        const bi = darwin.info(pid) orelse continue; // gone or not inspectable
+        try all.append(alloc, .{
+            .pid = pid,
+            .ppid = @intCast(bi.pbi_ppid),
+            .start = darwin.startFromInfo(bi),
+        });
     }
 }
 
@@ -317,6 +336,7 @@ const darwin = struct {
         // other size, so a layout drift must fail the build loudly.
         std.debug.assert(@sizeOf(proc_bsdinfo) == 136);
         std.debug.assert(@offsetOf(proc_bsdinfo, "pbi_status") == 4);
+        std.debug.assert(@offsetOf(proc_bsdinfo, "pbi_ppid") == 16);
         std.debug.assert(@offsetOf(proc_bsdinfo, "pbi_start_tvsec") == 120);
     }
 
@@ -328,14 +348,24 @@ const darwin = struct {
         buffersize: c_int,
     ) c_int;
 
-    extern "c" fn proc_listchildpids(ppid: c_int, buffer: ?*anyopaque, buffersize: c_int) c_int;
+    // Returns the number of pids written (buffer holds c_int pids).
+    extern "c" fn proc_listallpids(buffer: ?*anyopaque, buffersize: c_int) c_int;
 
-    fn startTime(pid: posix.pid_t) ?u64 {
+    fn info(pid: posix.pid_t) ?proc_bsdinfo {
         var bi: proc_bsdinfo = undefined;
         const size: c_int = @sizeOf(proc_bsdinfo);
         if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, size) != size) return null;
-        if (bi.pbi_status == SZOMB) return null; // zombie: effectively dead
+        return bi;
+    }
+
+    fn startFromInfo(bi: proc_bsdinfo) u64 {
         return normalizeStart(bi.pbi_start_tvsec *% 1_000_000 +% bi.pbi_start_tvusec);
+    }
+
+    fn startTime(pid: posix.pid_t) ?u64 {
+        const bi = info(pid) orelse return null;
+        if (bi.pbi_status == SZOMB) return null; // zombie: effectively dead
+        return startFromInfo(bi);
     }
 };
 
@@ -359,4 +389,33 @@ test "parseStat rejects malformed input" {
 test "normalizeStart never yields the unknown sentinel" {
     try std.testing.expectEqual(@as(u64, 1), normalizeStart(0));
     try std.testing.expectEqual(@as(u64, 42), normalizeStart(42));
+}
+
+test "buildTree collects transitive descendants and skips unrelated ones" {
+    const alloc = std.testing.allocator;
+    // 100 -> 200 -> 300 is the tree; 400 (child of init) is unrelated, and
+    // 1 is its own parent (a self-loop that must not spin the fixpoint).
+    const all = [_]Entry{
+        .{ .pid = 1, .ppid = 1, .start = 10 },
+        .{ .pid = 100, .ppid = 1, .start = 11 },
+        .{ .pid = 200, .ppid = 100, .start = 12 },
+        .{ .pid = 300, .ppid = 200, .start = 13 },
+        .{ .pid = 400, .ppid = 1, .start = 14 },
+    };
+    var out: std.ArrayList(Proc) = .empty;
+    defer out.deinit(alloc);
+    try buildTree(alloc, 100, &all, &out);
+
+    var seen_100 = false;
+    var seen_200 = false;
+    var seen_300 = false;
+    for (out.items) |p| {
+        switch (p.pid) {
+            100 => seen_100 = true,
+            200 => seen_200 = true,
+            300 => seen_300 = true,
+            else => return error.TestUnexpectedResult, // 1 and 400 are not descendants
+        }
+    }
+    try std.testing.expect(seen_100 and seen_200 and seen_300);
 }
