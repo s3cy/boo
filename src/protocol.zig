@@ -15,6 +15,10 @@ pub const max_payload = 1 << 20;
 
 pub const header_len = 5;
 
+/// Payload prefix sent by a daemon's `switch-attach` command to tell
+/// the attached client which session to re-attach to.
+pub const switch_to_prefix = "switch-to:";
+
 pub const MsgType = enum(u8) {
     // Client to daemon.
     attach = 1,

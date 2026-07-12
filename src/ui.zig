@@ -1170,9 +1170,6 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
 
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
     ui.layout = .init(ws.row, ws.col);
-    // Running inside a boo session: never attach the session hosting
-    // this UI, or its output would feed back into itself forever.
-    ui.host_name = posix.getenv("BOO");
 
     try ui.refreshSessions();
     if (ui.selected == null) ui.selectInitial();
@@ -1228,8 +1225,6 @@ const Ui = struct {
     sessions: std.ArrayList(Entry) = .empty,
     /// Selected (and focused) session index, when any session exists.
     selected: ?usize = null,
-    /// The session this UI itself runs inside, when nested in boo.
-    host_name: ?[]const u8 = null,
     /// Name of the previously focused session for C-a C-a toggling.
     last_name: ?[]u8 = null,
     /// Session name the current view is attached to; outlives a
@@ -2113,6 +2108,7 @@ const Ui = struct {
         // `v` dangling, so an exit defers the refresh until the
         // message loop is done with the pointer.
         var ended = false;
+        var switched: ?[]u8 = null;
         while (true) {
             const msg = v.decoder.next() catch {
                 self.markViewLost();
@@ -2124,8 +2120,13 @@ const Ui = struct {
                     self.need_render = true;
                 },
                 .detached => {
-                    v.state = .stolen;
-                    self.setMessage("session attached elsewhere", .{});
+                    if (std.mem.startsWith(u8, msg.payload, protocol.switch_to_prefix)) {
+                        v.state = .stolen;
+                        switched = self.alloc.dupe(u8, msg.payload[protocol.switch_to_prefix.len..]) catch null;
+                    } else {
+                        v.state = .stolen;
+                        self.setMessage("session attached elsewhere", .{});
+                    }
                     self.need_render = true;
                 },
                 .screen => {
@@ -2165,7 +2166,19 @@ const Ui = struct {
             }
             if (v.state != .live) break;
         }
-        if (ended) self.refreshSessions() catch {};
+        if (switched) |target| {
+            defer self.alloc.free(target);
+            for (self.sessions.items, 0..) |entry, i| {
+                if (std.mem.eql(u8, entry.name, target)) {
+                    self.selected = i;
+                    self.attachSelected();
+                    self.setMessage("switched to {s}", .{target});
+                    break;
+                }
+            }
+        } else if (ended) {
+            self.refreshSessions() catch {};
+        }
     }
 
     fn liveView(self: *Ui) ?*View {
@@ -2275,11 +2288,6 @@ const Ui = struct {
         self.need_render = true;
     }
 
-    fn isHost(self: *Ui, idx: usize) bool {
-        const host = self.host_name orelse return false;
-        return std.mem.eql(u8, self.sessions.items[idx].name, host);
-    }
-
     /// Re-attach the focused session after our attachment broke, once
     /// no other client holds it: stolen views recover when the thief
     /// lets go, lost sockets when the daemon answers again, and a
@@ -2296,16 +2304,14 @@ const Ui = struct {
         if (broken) self.attachSelected();
     }
 
-    /// The most recently active session eligible for automatic
-    /// attachment: never this UI's host, and never a session some
-    /// other client holds. Automatic focus must not steal; only a
+    /// The most recently active unattached session eligible for
+    /// automatic attachment. Automatic focus must not steal; only a
     /// deliberate click or keypress may. An active browse also
     /// suppresses it, so the highlight is not yanked mid-decision.
     fn autoFocusable(self: *Ui) ?usize {
         if (self.browsing) return null;
         var best: ?usize = null;
         for (self.sessions.items, 0..) |entry, i| {
-            if (self.isHost(i)) continue;
             if (entry.attached) continue;
             if (best == null or entry.idle_ms < self.sessions.items[best.?].idle_ms) {
                 best = i;
@@ -2321,7 +2327,6 @@ const Ui = struct {
     fn selectInitial(self: *Ui) void {
         var best: ?usize = null;
         for (self.sessions.items, 0..) |entry, i| {
-            if (self.isHost(i)) continue;
             if (best == null or entry.idle_ms < self.sessions.items[best.?].idle_ms) {
                 best = i;
             }
@@ -2373,10 +2378,6 @@ const Ui = struct {
 
     fn focusIndex(self: *Ui, idx: usize) void {
         if (idx >= self.sessions.items.len) return;
-        if (self.isHost(idx)) {
-            self.setMessage("{s} hosts this ui", .{self.sessions.items[idx].name});
-            return;
-        }
         if (self.selected) |cur| {
             if (cur != idx) self.rememberLast(cur);
         }
@@ -2389,16 +2390,10 @@ const Ui = struct {
         const len = self.sessions.items.len;
         if (len == 0) return;
         const cur = self.selected orelse len - 1;
-        // Step past the session hosting this UI, when nested.
-        var idx = cur;
-        for (0..len) |_| {
-            idx = if (dir > 0)
-                (idx + 1) % len
-            else
-                (idx + len - 1) % len;
-            if (!self.isHost(idx)) break;
-        }
-        if (self.isHost(idx)) return;
+        const idx = if (dir > 0)
+            (cur + 1) % len
+        else
+            (cur + len - 1) % len;
         self.focusIndex(idx);
     }
 
@@ -2414,8 +2409,7 @@ const Ui = struct {
     }
 
     /// Move the sidebar selection one row without attaching: arrow
-    /// browsing. Wraps and steps past the host session like
-    /// focusOffset.
+    /// browsing. Wraps.
     fn browseMove(self: *Ui, dir: i2) void {
         const len = self.sessions.items.len;
         if (len == 0) return;
@@ -2428,15 +2422,11 @@ const Ui = struct {
         self.message.clearRetainingCapacity();
         self.message_deadline = 0;
         const cur = self.selected orelse len - 1;
-        var idx = cur;
-        for (0..len) |_| {
-            idx = if (dir > 0)
-                (idx + 1) % len
-            else
-                (idx + len - 1) % len;
-            if (!self.isHost(idx)) break;
-        }
-        if (!self.isHost(idx)) self.selected = idx;
+        const idx = if (dir > 0)
+            (cur + 1) % len
+        else
+            (cur + len - 1) % len;
+        self.selected = idx;
         self.scrollSelectedIntoView();
         self.need_render = true;
     }
@@ -4079,16 +4069,14 @@ test "ui: automatic focus skips attached sessions and prefers recent ones" {
     try ui.sessions.append(alloc, .{ .name = &bb, .attached = true, .idle_ms = 10, .title = &no_title });
     try ui.sessions.append(alloc, .{ .name = &cc, .attached = false, .idle_ms = 90, .title = &no_title });
 
-    // bb is the most recent but held elsewhere; aa wins among the free.
+    // aa is the most recent unattached session.
     try std.testing.expectEqual(@as(?usize, 0), ui.autoFocusable());
 
-    // The session hosting this UI is never an automatic candidate.
-    ui.host_name = "aa";
+    // Once taken, cc wins.
+    ui.sessions.items[0].attached = true;
     try std.testing.expectEqual(@as(?usize, 2), ui.autoFocusable());
 
     // Every session held elsewhere: nothing to attach automatically.
-    ui.host_name = null;
-    ui.sessions.items[0].attached = true;
     ui.sessions.items[2].attached = true;
     try std.testing.expectEqual(@as(?usize, null), ui.autoFocusable());
 }

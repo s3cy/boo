@@ -589,6 +589,25 @@ pub const Daemon = struct {
                 return;
             }
             self.rename(conn, argv[1]);
+        } else if (std.mem.eql(u8, cmd, "switch-attach")) {
+            if (argv.len != 2) {
+                conn.send(.err, "usage: switch-attach <session>");
+                return;
+            }
+            var buf: [4096]u8 = undefined;
+            const switch_payload = std.fmt.bufPrint(&buf, "switch-to:{s}", .{argv[1]}) catch {
+                conn.send(.err, "session name too long");
+                return;
+            };
+            if (self.detachAttached(switch_payload))
+                conn.send(.ok, "")
+            else
+                conn.send(.err, "no attached client");
+        } else if (std.mem.eql(u8, cmd, "detach-ui")) {
+            if (self.detachAttached("launch-ui"))
+                conn.send(.ok, "")
+            else
+                conn.send(.err, "no attached client");
         } else if (std.mem.eql(u8, cmd, "quit")) {
             // Retire the listener before acking: by the time the kill
             // client sees the reply, the socket file is gone, so a
@@ -812,6 +831,21 @@ pub const Daemon = struct {
     fn updatePassthrough(self: *Daemon) void {
         const attached = self.attachedConn() != null;
         if (self.liveWindow()) |w| w.passthrough = attached;
+    }
+
+    /// Detach the attached client (if any) with the given `.detached`
+    /// payload. Returns true if a client was detached.
+    fn detachAttached(self: *Daemon, payload: []const u8) bool {
+        for (self.conns.items) |c| {
+            if (c.attached and !c.closed) {
+                c.send(.detached, payload);
+                c.attached = false;
+                c.shutdown = true;
+                self.updatePassthrough();
+                return true;
+            }
+        }
+        return false;
     }
 
     fn resizeWindow(self: *Daemon, rows: u16, cols: u16) void {

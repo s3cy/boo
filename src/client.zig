@@ -18,7 +18,18 @@ const log = std.log.scoped(.client);
 const enter_sequence = "\x1b[?1049h";
 const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
 
-pub const Outcome = enum { detached, stolen, ended, lost };
+pub const Outcome = union(enum) {
+    detached: void,
+    stolen: void,
+    ended: void,
+    lost: void,
+    /// The daemon told us to re-attach to this session. Owned, caller
+    /// frees.
+    switched: []const u8,
+    /// The daemon told us to launch the UI (boo ui ran inside the
+    /// session).
+    launch_ui: void,
+};
 
 /// How long to wait for the terminal to answer the startup OSC 11
 /// background probe. Terminals that support it answer within a few
@@ -170,24 +181,28 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
         // Daemon -> terminal output and lifecycle messages.
         if (fds[1].revents != 0) {
             const n = posix.read(sock, &buf) catch 0;
-            if (n == 0) return .lost;
+            if (n == 0) return .{ .lost = {} };
             try decoder.feed(buf[0..n]);
             while (try decoder.next()) |msg| {
                 switch (msg.type) {
                     .output => try protocol.writeAll(1, msg.payload),
                     .detached => {
-                        if (std.mem.eql(u8, msg.payload, "stolen")) return .stolen;
+                        if (std.mem.eql(u8, msg.payload, "launch-ui")) return .{ .launch_ui = {} };
+                        if (std.mem.startsWith(u8, msg.payload, protocol.switch_to_prefix)) {
+                            return .{ .switched = try alloc.dupe(u8, msg.payload[protocol.switch_to_prefix.len..]) };
+                        }
+                        if (std.mem.eql(u8, msg.payload, "stolen")) return .{ .stolen = {} };
                         if (std.mem.eql(u8, msg.payload, "detached-eof")) {
                             eof_guard = true;
                         }
-                        return .detached;
+                        return .{ .detached = {} };
                     },
                     .exit => {
                         // Sessions often end because the user typed
                         // C-d at the session's shell; treat the tail
                         // as EOF-dangerous.
                         eof_guard = true;
-                        return .ended;
+                        return .{ .ended = {} };
                     },
                     else => {},
                 }

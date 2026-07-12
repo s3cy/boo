@@ -244,6 +244,42 @@ fn mustControl(
 
 // -- Commands -------------------------------------------------------------
 
+/// If we're inside a boo session ($BOO is set), tell the outer daemon to
+/// detach its client and redirect it to `target`. Returns true if
+/// redirected (caller should exit).
+fn redirectIfNested(alloc: std.mem.Allocator, dir: []const u8, target: []const u8) bool {
+    if (posix.getenv("BOO") == null) return false;
+    return commandAnyAttached(alloc, dir, &.{ "switch-attach", target });
+}
+
+/// Tell the daemon with the attached client to detach it and launch
+/// the UI. Returns true if redirected (caller should exit).
+fn detachUi(alloc: std.mem.Allocator, dir: []const u8) bool {
+    if (posix.getenv("BOO") == null) return false;
+    return commandAnyAttached(alloc, dir, &.{"detach-ui"});
+}
+
+/// Scan all session daemons to find one with an attached client and
+/// send it a control command. Returns true if any daemon returned ok.
+fn commandAnyAttached(alloc: std.mem.Allocator, dir: []const u8, argv: []const []const u8) bool {
+    const sessions = paths.listSessions(alloc, dir) catch return false;
+    defer {
+        for (sessions) |s| alloc.free(s);
+        alloc.free(sessions);
+    }
+    for (sessions) |s| {
+        const sock = paths.socketPath(alloc, dir, s) catch continue;
+        defer alloc.free(sock);
+        const result = client.control(alloc, sock, argv, null) catch continue;
+        if (result.ok) {
+            alloc.free(result.text);
+            return true;
+        }
+        alloc.free(result.text);
+    }
+    return false;
+}
+
 fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name: ?[]const u8 = null;
     var detached = false;
@@ -280,6 +316,15 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
     return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), rows, cols, cwd);
+}
+
+fn runUi(alloc: std.mem.Allocator, dir: []const u8) !void {
+    const saved_stderr = redirectStderr();
+    defer restoreStderr(saved_stderr);
+    ui.run(alloc, dir) catch |err| switch (err) {
+        error.NotATty => fail(exit_runtime, "ui requires a terminal", .{}),
+        else => return err,
+    };
 }
 
 fn createSession(
@@ -349,6 +394,7 @@ fn createSession(
         try stdoutPrint(alloc, "{s}\n", .{name});
         return;
     }
+    if (redirectIfNested(alloc, dir, name)) return;
     try attachLoop(alloc, dir, name);
 }
 
@@ -366,29 +412,45 @@ fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer alloc.free(dir);
     const name = try resolveSession(alloc, dir, want);
     defer alloc.free(name);
+    if (redirectIfNested(alloc, dir, name)) return;
     try attachLoop(alloc, dir, name);
 }
 
 fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
-    const sock = try paths.socketPath(alloc, dir, name);
-    defer alloc.free(sock);
-    const outcome = client.attach(alloc, sock) catch |err| switch (err) {
-        error.FileNotFound, error.ConnectionRefused => fail(
-            exit_no_session,
-            "no session named {s}",
-            .{name},
-        ),
-        error.NotATty => fail(exit_runtime, "attach requires a terminal", .{}),
-        else => return err,
-    };
-    switch (outcome) {
-        .detached => std.debug.print("[detached from {s}]\n", .{name}),
-        .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{name}),
-        .ended => std.debug.print("[session {s} ended]\n", .{name}),
-        .lost => {
-            std.debug.print("[lost connection to {s}]\n", .{name});
-            posix.exit(exit_runtime);
-        },
+    var current: []const u8 = try alloc.dupe(u8, name);
+    defer alloc.free(current);
+    while (true) {
+        const sock = try paths.socketPath(alloc, dir, current);
+        defer alloc.free(sock);
+        const outcome = client.attach(alloc, sock) catch |err| switch (err) {
+            error.FileNotFound, error.ConnectionRefused => fail(
+                exit_no_session,
+                "no session named {s}",
+                .{current},
+            ),
+            error.NotATty => fail(exit_runtime, "attach requires a terminal", .{}),
+            else => return err,
+        };
+        switch (outcome) {
+            .detached => std.debug.print("[detached from {s}]\n", .{current}),
+            .stolen => std.debug.print("[session {s} attached elsewhere]\n", .{current}),
+            .ended => std.debug.print("[session {s} ended]\n", .{current}),
+            .lost => {
+                std.debug.print("[lost connection to {s}]\n", .{current});
+                posix.exit(exit_runtime);
+            },
+            .switched => |target| {
+                alloc.free(current);
+                current = target;
+                continue;
+            },
+            .launch_ui => {
+                try runUi(alloc, dir);
+                std.debug.print("[boo ui closed]\n", .{});
+                return;
+            },
+        }
+        break;
     }
 }
 
@@ -400,6 +462,13 @@ fn cmdUi(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
+
+    // If nested, tell the outer daemon to detach its client so this
+    // process can paint the UI on the real terminal instead of inside
+    // a PTY.
+    if (posix.getenv("BOO") != null) {
+        if (detachUi(alloc, dir)) return;
+    }
 
     // boo ui feeds session output through an in-process libghostty stream
     // whose VT logs would otherwise paint over the viewport: std.log writes
