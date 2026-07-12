@@ -557,12 +557,20 @@ pub const Daemon = struct {
                 @intFromBool(self.unread),
                 bell_idle,
             });
-            // Window title last; sanitized, so it cannot contain the
+            // Window title; sanitized, so it cannot contain the
             // tabs that separate the fields.
             if (self.liveWindow()) |w| {
                 for (w.title()) |byte| {
                     if (byte < 0x20 or byte == 0x7f) continue;
                     try out.append(self.alloc, byte);
+                }
+            }
+            try out.append(self.alloc, '\t');
+            // Cwd; empty when unavailable.
+            if (self.liveWindow()) |w| {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (cwd.ofPid(&buf, w.child_pid)) |dir| {
+                    try out.appendSlice(self.alloc, dir);
                 }
             }
             conn.send(.ok, out.items);

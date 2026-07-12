@@ -174,6 +174,9 @@ pub const SessionInfo = struct {
     bell_idle_ms: i64,
     /// Window title; slices into `text`.
     title: []const u8,
+    /// Process working directory at query time; slices into `text`.
+    /// Empty when unavailable.
+    cwd: []const u8,
 };
 
 /// Query a session daemon, deleting the socket when the daemon is gone.
@@ -200,25 +203,11 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, 
         return error.BadResponse;
     const out_idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
         return error.BadResponse;
-    // The remainder is `unread \t bell_idle_ms \t title` on a current
-    // daemon, `unread \t title` on one predating the bell field, or just
-    // `title` on one predating both. The title is tab-free, so leading
-    // fields peel off the front and the tab-free tail is the title;
-    // missing fields take their defaults (unread false, no bell).
-    const rest = it.rest();
-    var unread = false;
-    var bell_idle_ms: i64 = -1;
-    var title = rest;
-    if (std.mem.indexOfScalar(u8, rest, '\t')) |t1| {
-        unread = std.mem.eql(u8, rest[0..t1], "1");
-        const after = rest[t1 + 1 ..];
-        if (std.mem.indexOfScalar(u8, after, '\t')) |t2| {
-            bell_idle_ms = std.fmt.parseInt(i64, after[0..t2], 10) catch -1;
-            title = after[t2 + 1 ..];
-        } else {
-            title = after;
-        }
-    }
+    const unread = std.mem.eql(u8, it.next() orelse return error.BadResponse, "1");
+    const bell_idle_ms = std.fmt.parseInt(i64, it.next() orelse return error.BadResponse, 10) catch
+        return error.BadResponse;
+    const title = it.next() orelse return error.BadResponse;
+    const cwd = it.next() orelse "";
     return .{
         .text = result.text,
         .attached = attached,
@@ -227,6 +216,7 @@ pub fn sessionInfo(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, 
         .unread = unread,
         .bell_idle_ms = bell_idle_ms,
         .title = title,
+        .cwd = cwd,
     };
 }
 
@@ -478,6 +468,8 @@ fn cmdLs(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             defer alloc.free(tail);
             try out.appendSlice(alloc, tail);
             try appendJsonString(alloc, &out, entry.info.title);
+            try out.appendSlice(alloc, ",\"cwd\":");
+            try appendJsonString(alloc, &out, entry.info.cwd);
             try out.append(alloc, '}');
         }
         try out.appendSlice(alloc, "]\n");

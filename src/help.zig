@@ -189,9 +189,11 @@ pub const commands = [_]Entry{
         \\flags:
         \\  --json  emit a JSON array:
         \\          [{"name","attached","idle_ms","unread",
-        \\            "bell_idle_ms","title"}]
+        \\            "bell_idle_ms","title","cwd"}]
         \\          ("unread" flags unseen output; "bell_idle_ms" is the
-        \\           age of a bell rung while away, -1 if none)
+        \\           age of a bell rung while away, -1 if none;
+        \\           "cwd" is the process working directory, absent if
+        \\           unavailable)
         \\
         ,
     },
