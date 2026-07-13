@@ -414,25 +414,11 @@ pub const Window = struct {
     /// formatter's dump-everything default) only if the pins cannot
     /// resolve, which a sized terminal never produces.
     fn screenSelection(self: *Window) ?vt.Selection {
-        const pages = &self.term.screens.active.pages;
-        const tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return null;
-        const br = pages.pin(.{ .active = .{
-            .x = self.term.cols - 1,
-            .y = self.term.rows - 1,
-        } }) orelse return null;
-        return vt.Selection.init(tl, br, false);
+        return screenSelectionOf(&self.term);
     }
 
     fn writeCursorPos(self: *Window, writer: *std.Io.Writer) !void {
-        const cursor = &self.term.screens.active.cursor;
-        var row: usize = cursor.y;
-        var col: usize = cursor.x;
-        // CUP is relative to the scrolling region in origin mode.
-        if (self.term.modes.get(.origin)) {
-            row -|= self.term.scrolling_region.top;
-            col -|= self.term.scrolling_region.left;
-        }
-        try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
+        try writeCursorPosOf(&self.term, writer);
     }
 };
 
@@ -445,6 +431,37 @@ fn writeTitle(title: []const u8, writer: *std.Io.Writer) !void {
         try writer.writeByte(byte);
     }
     try writer.writeByte(0x07);
+}
+
+/// Selection spanning the visible screen of `term`'s active terminal
+/// screen, so a repaint excludes scrollback history. Null (the
+/// formatter's dump-everything default) only if the pins cannot
+/// resolve, which a sized terminal never produces. Shared by the
+/// daemon's `Window.repaint` and a client's live repaint.
+pub fn screenSelectionOf(term: *vt.Terminal) ?vt.Selection {
+    const pages = &term.screens.active.pages;
+    const tl = pages.pin(.{ .active = .{ .x = 0, .y = 0 } }) orelse return null;
+    const br = pages.pin(.{ .active = .{
+        .x = term.cols - 1,
+        .y = term.rows - 1,
+    } }) orelse return null;
+    return vt.Selection.init(tl, br, false);
+}
+
+/// Position the terminal cursor at `term`'s cursor. Tabstop and
+/// scrolling-region rehydration is emitted after the screen extras in a
+/// repaint and moves the cursor, so this must run last. CUP is relative
+/// to the scrolling region in origin mode. Shared by the daemon's
+/// `Window.repaint` and a client's live repaint.
+pub fn writeCursorPosOf(term: *vt.Terminal, writer: *std.Io.Writer) !void {
+    const cursor = &term.screens.active.cursor;
+    var row: usize = cursor.y;
+    var col: usize = cursor.x;
+    if (term.modes.get(.origin)) {
+        row -|= term.scrolling_region.top;
+        col -|= term.scrolling_region.left;
+    }
+    try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
 }
 
 /// Resets every piece of terminal state a window's repaint or

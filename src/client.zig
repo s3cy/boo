@@ -4,10 +4,13 @@
 const std = @import("std");
 const posix = std.posix;
 
+const osc52 = @import("osc52.zig");
 const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
+const viewterm = @import("viewterm.zig");
 const window = @import("window.zig");
 const keys = @import("keys.zig");
+const vt = @import("ghostty-vt");
 
 const log = std.log.scoped(.client);
 
@@ -15,8 +18,75 @@ const log = std.log.scoped(.client);
 /// screen (like screen and tmux), so detaching restores the user's
 /// pre-attach shell view. `1049h` also saves the cursor, which the
 /// final `1049l` restores after undoing any state the session set.
-const enter_sequence = "\x1b[?1049h";
+/// SGR mouse (1006) and button events (1002) are enabled so wheel
+/// events can be intercepted for local scrollback, mirroring boo ui.
+const enter_sequence = "\x1b[?1049h" ++ viewterm.mouse_capture;
 const restore_sequence = window.reset_state_sequence ++ "\x1b[?1049l";
+
+/// Mouse reporting modes boo keeps on the real terminal so wheel events
+/// arrive as SGR mouse sequences for local scrollback. A repaint's
+/// `sanitize_sequence` disables mouse reporting; without re-establishing
+/// this, the real terminal falls back to alternate-scroll (wheel becomes
+/// arrow keys) instead of reporting wheel events for boo to intercept.
+const mouse_capture = viewterm.mouse_capture;
+
+/// Rows per mouse wheel tick, matching boo ui.
+const wheel_lines = viewterm.wheel_lines;
+
+/// How long to wait for a follow-up byte before treating a bare Esc at
+/// the end of a read as a lone Esc keypress (which snaps scrollback to
+/// the bottom). Mirrors boo ui.
+const esc_flush_ms = viewterm.esc_flush_ms;
+
+/// How long a transient status message (the copy confirmation) stays on
+/// the bottom row. Shared with boo ui.
+const message_ttl_ms = viewterm.message_ttl_ms;
+
+/// Dim style for the transient status row, matching boo ui.
+const style_dim = viewterm.style_dim;
+
+/// A cell position in viewport coordinates (0-based), used for mouse
+/// selection. Shared with boo ui.
+const CellPos = viewterm.CellPos;
+
+/// A parsed SGR mouse event, shared with boo ui.
+const Mouse = viewterm.Mouse;
+
+const Handler = vt.TerminalStream.Handler;
+
+/// Stream callback state. The local terminal answers terminal queries
+/// (DSR, DA, XTWINOPS, ...) itself only while it owns the view: while
+/// scrolled back, while a selection or transient message is active, or
+/// while still seeding from the attach replay. While live, the real
+/// terminal answers queries through passthrough, so the local terminal
+/// stays mute to avoid duplicate replies. The device-attributes and size
+/// callbacks are shared with boo ui (`viewterm`); the write-pty and
+/// xtversion callbacks differ.
+// ponytail: module-level, safe because attachLoop is single-threaded.
+// An accidental nested call would silently corrupt state; wrap in a
+// struct if attach ever becomes re-entrant.
+var reply_sock: posix.fd_t = -1;
+var replies_on: bool = false;
+
+/// Whether the local terminal should answer terminal queries itself
+/// instead of passing them through to the real terminal. The local
+/// terminal owns the view when still seeding from the attach replay,
+/// scrolled back into history, or while a selection or transient message
+/// is active.
+fn repliesNeeded(awaiting_repaint: bool, scrolled: bool, select_active: bool, message_active: bool) bool {
+    return awaiting_repaint or scrolled or select_active or message_active;
+}
+
+fn effectWritePty(handler: *Handler, data: [:0]const u8) void {
+    _ = handler;
+    if (!replies_on or reply_sock < 0) return;
+    protocol.writeMsg(reply_sock, .input, data) catch {};
+}
+
+fn effectXtversion(handler: *Handler) []const u8 {
+    _ = handler;
+    return "boo " ++ @import("main.zig").version;
+}
 
 pub const Outcome = union(enum) {
     detached: void,
@@ -89,6 +159,8 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
 
     // Raw mode, then move the terminal onto its alternate screen so
     // the session view never disturbs the user's shell scrollback.
+    // Mouse reporting is enabled so wheel events can be intercepted
+    // for local scrollback.
     const saved = try posix.tcgetattr(tty);
     var raw = saved;
     rawMode(&raw);
@@ -97,6 +169,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     // repeating; read by the deferred restore.
     var eof_guard = false;
     defer restoreTty(tty, saved, restore_sequence, eof_guard, 'd');
+
     try protocol.writeAll(1, enter_sequence);
 
     // Handshake with our current size first so the daemon sees the
@@ -104,6 +177,11 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     // or resize racing a slow attach would otherwise break the
     // connection or miss the initial size.
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
+    // Mark this as a ui-style view before attaching so the daemon
+    // replays scrollback history on attach; the local terminal pages
+    // it on a wheel-up, just like boo ui. An older daemon ignores the
+    // unknown `.ui` message and attaches with no history.
+    try protocol.writeMsg(sock, .ui, "");
     try protocol.writeMsg(sock, .attach, &(protocol.SizePayload{
         .rows = ws.row,
         .cols = ws.col,
@@ -121,8 +199,73 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
     }
     if (leftover_len > 0) protocol.writeMsg(sock, .input, probe_scratch[0..leftover_len]) catch {};
 
+    // Local terminal emulator: all daemon output is fed through this so
+    // the viewport can page back through history. While live at the
+    // bottom, bytes also pass through to the real terminal raw (it is
+    // the renderer); while scrolled back, the local terminal's viewport
+    // is rendered instead.
+    var term = try vt.Terminal.init(alloc, .{
+        .cols = ws.col,
+        .rows = ws.row,
+        .max_scrollback = 512 * 1024,
+    });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    // The local terminal answers terminal queries itself; the callbacks
+    // are gated by `replies_on` so they only fire while the local
+    // terminal owns the view (scrolled or still seeding).
+    stream.handler.effects = .{
+        .write_pty = &effectWritePty,
+        .bell = null,
+        .color_scheme = null,
+        .device_attributes = &viewterm.effectDeviceAttributes,
+        .enquiry = null,
+        .size = &viewterm.effectSize,
+        .title_changed = null,
+        .pwd_changed = null,
+        .xtversion = &effectXtversion,
+    };
+    reply_sock = sock;
+    defer reply_sock = -1;
+
     var decoder: protocol.Decoder = .init(alloc);
     defer decoder.deinit();
+
+    // Scrollback state.
+    var scrolled: bool = false;
+    // True until the daemon's first `.screen` after attach lands, so the
+    // history replay and repaint seed the local terminal without
+    // flashing through the real terminal; the `.screen` releases it.
+    var awaiting_repaint = true;
+    // Which screen the application is on, tracked from `.screen`
+    // messages: the passthrough strips screen toggles, so the local
+    // terminal cannot see them itself.
+    var alt_screen_active = false;
+    // Mouse selection state (viewport coordinates), mirroring boo ui:
+    // a left-press sets the anchor, drag extends the head, release
+    // copies the span to the clipboard via OSC 52 and clears it. A null
+    // anchor means no selection in progress. While a selection is
+    // active, output is fed to the local terminal but not passed through
+    // (the viewport is frozen for the selection).
+    var select_anchor: ?CellPos = null;
+    var select_head: CellPos = .{ .x = 0, .y = 0 };
+    replies_on = true;
+    defer replies_on = false;
+    // ESC/CSI hold buffer for input parsing: a sequence can split across
+    // reads, and wheel events must be intercepted whole.
+    var hold: [64]u8 = undefined;
+    var hold_len: usize = 0;
+    // A bare Esc held at the end of a read is ambiguous with the start
+    // of an escape sequence; `esc_deadline` is when to flush it.
+    var esc_deadline: i64 = 0;
+    // Transient status message (the copy confirmation) shown on the bottom
+    // row for `message_ttl_ms`, matching boo ui. While one is active the
+    // viewport renders from the local terminal so the message stays put
+    // over new output, like boo ui's borrowed bottom row.
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(std.heap.c_allocator);
+    var message_deadline: i64 = 0;
 
     var buf: [32 * 1024]u8 = undefined;
     var fds = [_]posix.pollfd{
@@ -137,7 +280,46 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
         // poll() ignores negative fds; once stdin is gone we only wait
         // for the daemon's detach acknowledgement.
         fds[0].fd = if (stdin_open) tty else -1;
-        _ = try posix.poll(&fds, -1);
+        // A held bare Esc gets a short timeout to disambiguate from the
+        // start of an escape sequence; a live transient message gets a
+        // timeout to expire; otherwise block indefinitely.
+        const now_poll = std.time.milliTimestamp();
+        const next_deadline: i64 = blk: {
+            var d: i64 = -1;
+            if (esc_deadline != 0) d = esc_deadline;
+            if (message_deadline != 0) d = if (d < 0) message_deadline else @min(d, message_deadline);
+            break :blk d;
+        };
+        const timeout: i32 = if (next_deadline < 0)
+            -1
+        else
+            @intCast(@min(@as(i64, std.math.maxInt(i32)), @max(@as(i64, 0), next_deadline - now_poll)));
+        _ = try posix.poll(&fds, timeout);
+
+        // A held bare Esc whose deadline passed is a lone Esc keypress.
+        if (esc_deadline != 0 and std.time.milliTimestamp() >= esc_deadline) {
+            esc_deadline = 0;
+            if (hold_len == 1 and hold[0] == 0x1b) {
+                hold_len = 0;
+                if (scrolled or select_anchor != null) {
+                    resumeLive(&term, &scrolled, &select_anchor, &message, &message_deadline);
+                } else {
+                    protocol.writeMsg(sock, .input, "\x1b") catch {};
+                }
+                replies_on = repliesNeeded(awaiting_repaint, scrolled, select_anchor != null, message_deadline != 0);
+            }
+        }
+
+        // A transient status message has expired: drop it and repaint the
+        // viewport without the overlay.
+        if (message_deadline != 0 and std.time.milliTimestamp() >= message_deadline) {
+            message_deadline = 0;
+            message.clearRetainingCapacity();
+            if (!awaiting_repaint and select_anchor == null) {
+                renderState(&term, scrolled, null);
+            }
+            replies_on = repliesNeeded(awaiting_repaint, scrolled, select_anchor != null, false);
+        }
 
         // Signals.
         if (fds[2].revents != 0) {
@@ -151,6 +333,18 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                             .rows = new_ws.row,
                             .cols = new_ws.col,
                         }).encode()) catch {};
+                        term.resize(alloc, new_ws.col, new_ws.row) catch {};
+                        // Re-render at the new size. While still seeding,
+                        // the viewport is blank; the repaint's `.screen`
+                        // will release it.
+                        if (!awaiting_repaint) {
+                            if (select_anchor) |a| {
+                                renderSelect(&term, a, select_head);
+                            } else {
+                                const msg: ?[]const u8 = if (message_deadline != 0) message.items else null;
+                                renderState(&term, scrolled, msg);
+                            }
+                        }
                     },
                     else => protocol.writeMsg(sock, .detach_req, "") catch {},
                 };
@@ -158,7 +352,7 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
             }
         }
 
-        // Terminal input -> daemon.
+        // Terminal input -> daemon or scroll event.
         if (stdin_open and fds[0].revents != 0) {
             const n = posix.read(tty, &buf) catch 0;
             if (n == 0) {
@@ -166,15 +360,20 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
                 stdin_open = false;
                 protocol.writeMsg(sock, .detach_req, "") catch {};
             } else {
-                // The daemon may already have detached this client
-                // and closed the connection while these bytes were
-                // in flight (a held key racing the detach
-                // acknowledgement). The failure is not fatal: stop
-                // forwarding and let the queued lifecycle message or
-                // the socket EOF below decide the outcome.
-                protocol.writeMsg(sock, .input, buf[0..n]) catch {
-                    stdin_open = false;
-                };
+                esc_deadline = processInput(
+                    buf[0..n],
+                    &hold,
+                    &hold_len,
+                    &term,
+                    &scrolled,
+                    alt_screen_active,
+                    sock,
+                    &select_anchor,
+                    &select_head,
+                    &message,
+                    &message_deadline,
+                );
+                replies_on = repliesNeeded(awaiting_repaint, scrolled, select_anchor != null, message_deadline != 0);
             }
         }
 
@@ -185,7 +384,46 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
             try decoder.feed(buf[0..n]);
             while (try decoder.next()) |msg| {
                 switch (msg.type) {
-                    .output => try protocol.writeAll(1, msg.payload),
+                    .output => {
+                        // Always feed the local terminal so its state
+                        // (and scrollback) stays current.
+                        stream.nextSlice(msg.payload);
+                        if (awaiting_repaint or scrolled or select_anchor != null) {
+                            // The viewport is pinned (seeding, scrolled, or
+                            // selecting): new output lands below it, so no
+                            // re-render is needed.
+                        } else if (message_deadline != 0) {
+                            // A transient message is borrowing the bottom
+                            // row: render from the local terminal so new
+                            // output shows on every row but that one, like
+                            // boo ui's composited status row.
+                            renderViewportStatus(&term, message.items, style_dim);
+                        } else {
+                            // Live at the bottom with no overlay: pass
+                            // through raw so the real terminal renders.
+                            protocol.writeAll(1, msg.payload) catch {};
+                        }
+                    },
+                    .screen => {
+                        alt_screen_active = std.mem.eql(u8, msg.payload, "alt");
+                        if (awaiting_repaint) {
+                            // The history replay and repaint have seeded
+                            // the local terminal; paint the live screen
+                            // (with modes) onto the real terminal and go
+                            // live.
+                            awaiting_repaint = false;
+                            replies_on = repliesNeeded(false, scrolled, select_anchor != null, message_deadline != 0);
+                            renderLive(&term);
+                        } else if (!scrolled and select_anchor == null) {
+                            // A screen change arrives with a repaint whose
+                            // sanitize disables mouse reporting on the real
+                            // terminal; re-establish boo's wheel capture
+                            // when the application isn't using the mouse,
+                            // so the wheel keeps paging scrollback instead
+                            // of becoming alternate-scroll arrow keys.
+                            ensureMouseCapture(&term);
+                        }
+                    },
                     .detached => {
                         if (std.mem.eql(u8, msg.payload, "launch-ui")) return .{ .launch_ui = {} };
                         if (std.mem.startsWith(u8, msg.payload, protocol.switch_to_prefix)) {
@@ -209,6 +447,442 @@ pub fn attach(alloc: std.mem.Allocator, socket_path: []const u8) !Outcome {
             }
         }
     }
+}
+
+/// Process terminal input: intercept wheel events for local scrollback
+/// and mouse selection, and forward everything else to the daemon. A
+/// sequence can split across reads, so `hold`/`hold_len` carry an
+/// in-progress ESC or CSI sequence between calls. Returns a deadline
+/// (millis) at which a held bare Esc should be flushed as a lone Esc, or
+/// 0 if none.
+fn processInput(
+    bytes: []const u8,
+    hold: *[64]u8,
+    hold_len: *usize,
+    term: *vt.Terminal,
+    scrolled: *bool,
+    alt_screen_active: bool,
+    sock: posix.fd_t,
+    select_anchor: *?CellPos,
+    select_head: *CellPos,
+    message: *std.ArrayList(u8),
+    message_deadline: *i64,
+) i64 {
+    var fwd_buf: [4096]u8 = undefined;
+    var fwd_len: usize = 0;
+
+    const flush = struct {
+        fn run(fwd: []const u8, s: posix.fd_t) void {
+            if (fwd.len > 0) protocol.writeMsg(s, .input, fwd) catch {};
+        }
+    };
+
+    // Defer the snap-back render until the end so a single input chunk
+    // renders once even if it mixes forwarded bytes with other events.
+    var snap_pending = false;
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const byte = bytes[i];
+
+        if (hold_len.* > 0) {
+            // Inside a held sequence.
+            if (hold_len.* == 1 and hold[0] == 0x1b) {
+                // Held bare Esc; this byte decides its fate.
+                if (byte == '[') {
+                    hold[1] = '[';
+                    hold_len.* = 2;
+                    i += 1;
+                    continue;
+                }
+                // Not a CSI: the Esc is a lone Esc (or starts a non-CSI
+                // escape). Forward it, then re-examine this byte.
+                if (scrolled.*) snap_pending = true;
+                flush.run(fwd_buf[0..fwd_len], sock);
+                fwd_len = 0;
+                flush.run("\x1b", sock);
+                hold_len.* = 0;
+                continue;
+            }
+
+            // CSI hold (hold[0..2] == ESC [).
+            if (hold_len.* >= hold.len) {
+                // Overflow: forward the hold as-is and re-examine byte.
+                if (scrolled.*) snap_pending = true;
+                flush.run(fwd_buf[0..fwd_len], sock);
+                fwd_len = 0;
+                flush.run(hold[0..hold_len.*], sock);
+                hold_len.* = 0;
+                continue;
+            }
+            hold[hold_len.*] = byte;
+            hold_len.* += 1;
+            i += 1;
+            if (isCsiFinal(byte)) {
+                const seq = hold[0..hold_len.*];
+                hold_len.* = 0;
+                if (parseMouseEvent(seq)) |ev| {
+                    if (ev.isWheel()) {
+                        // Wheel events are press-only; ignore any release.
+                        if (!ev.release) {
+                            flush.run(fwd_buf[0..fwd_len], sock);
+                            fwd_len = 0;
+                            handleWheel(term, scrolled, alt_screen_active, ev.code & 1 == 1, seq, sock, message, message_deadline);
+                        }
+                    } else {
+                        // Non-wheel mouse: drive a selection when the
+                        // application isn't using the mouse, else forward.
+                        flush.run(fwd_buf[0..fwd_len], sock);
+                        fwd_len = 0;
+                        handleMouse(term, scrolled, ev, seq, sock, select_anchor, select_head, message, message_deadline);
+                    }
+                    continue;
+                }
+                if (scrolled.*) snap_pending = true;
+                if (fwd_len + seq.len <= fwd_buf.len) {
+                    @memcpy(fwd_buf[fwd_len..][0..seq.len], seq);
+                    fwd_len += seq.len;
+                } else {
+                    flush.run(fwd_buf[0..fwd_len], sock);
+                    fwd_len = 0;
+                    flush.run(seq, sock);
+                }
+            } else if (byte == 0x1b) {
+                // A new Esc aborts the CSI: forward the hold (minus the
+                // new Esc) and hold the new Esc.
+                if (scrolled.*) snap_pending = true;
+                flush.run(fwd_buf[0..fwd_len], sock);
+                fwd_len = 0;
+                flush.run(hold[0 .. hold_len.* - 1], sock);
+                hold[0] = 0x1b;
+                hold_len.* = 1;
+            }
+            // else: keep accumulating.
+            continue;
+        }
+
+        if (byte == 0x1b) {
+            hold[0] = 0x1b;
+            hold_len.* = 1;
+            i += 1;
+            continue;
+        }
+
+        // Plain byte: forward.
+        if (scrolled.*) snap_pending = true;
+        if (fwd_len < fwd_buf.len) {
+            fwd_buf[fwd_len] = byte;
+            fwd_len += 1;
+        } else {
+            flush.run(fwd_buf[0..fwd_len], sock);
+            fwd_buf[0] = byte;
+            fwd_len = 1;
+        }
+        i += 1;
+    }
+
+    if (snap_pending and scrolled.*) resumeLive(term, scrolled, select_anchor, message, message_deadline);
+    flush.run(fwd_buf[0..fwd_len], sock);
+
+    // A held bare Esc at the end of a read is ambiguous: the Esc key, or
+    // the start of a sequence split across reads. Wait briefly for more.
+    if (hold_len.* == 1 and hold[0] == 0x1b) {
+        return std.time.milliTimestamp() + esc_flush_ms;
+    }
+    return 0;
+}
+
+/// Whether `b` is a CSI final byte (0x40-0x7E). The introducer `[`
+/// (0x5B) is itself in this range, which is why the hold state machine
+/// only looks for a final byte once past `ESC [`.
+fn isCsiFinal(b: u8) bool {
+    return b >= 0x40 and b <= 0x7e;
+}
+
+/// If `seq` is an SGR mouse event, parse it. Returns null otherwise.
+fn parseMouseEvent(seq: []const u8) ?Mouse {
+    if (seq.len < 5 or seq[0] != 0x1b or seq[1] != '[' or seq[2] != '<') return null;
+    const final_b = seq[seq.len - 1];
+    if (final_b != 'M' and final_b != 'm') return null;
+    const body = seq[3 .. seq.len - 1];
+    var it = std.mem.splitScalar(u8, body, ';');
+    const code = parseField(it.next()) orelse return null;
+    const x = parseField(it.next()) orelse return null;
+    const y = parseField(it.next()) orelse return null;
+    return .{ .code = code, .x = x, .y = y, .release = final_b == 'm' };
+}
+
+fn parseField(s: ?[]const u8) ?u16 {
+    const slice = s orelse return null;
+    if (slice.len == 0) return null;
+    return std.fmt.parseInt(u16, slice, 10) catch return null;
+}
+
+/// Handle a wheel event, mirroring boo ui's wheelViewport: applications
+/// that asked for mouse reporting get the event; alternate-screen
+/// applications get arrow keys (alternate-scroll); otherwise the local
+/// scrollback is paged. `seq` is the raw SGR mouse sequence, forwarded
+/// verbatim in the first case.
+///
+/// Like boo ui, "scrolled" is derived from `viewportIsBottom()` after
+/// the scroll, so wheeling up when there is no history never enters
+/// scrollback mode (and never shows the scrollback hint).
+fn handleWheel(
+    term: *vt.Terminal,
+    scrolled: *bool,
+    alt_screen_active: bool,
+    down: bool,
+    seq: []const u8,
+    sock: posix.fd_t,
+    message: *std.ArrayList(u8),
+    message_deadline: *i64,
+) void {
+    if (term.flags.mouse_event != .none) {
+        protocol.writeMsg(sock, .input, seq) catch {};
+        return;
+    }
+    if (alt_screen_active) {
+        const arrow = viewterm.cursorArrowSeq(term, down);
+        var n: u16 = 0;
+        while (n < wheel_lines) : (n += 1) {
+            protocol.writeMsg(sock, .input, arrow) catch {};
+        }
+        return;
+    }
+    const was_at_bottom = term.screens.active.viewportIsBottom();
+    const delta: isize = if (down) @as(isize, wheel_lines) else -@as(isize, wheel_lines);
+    term.scrollViewport(.{ .delta = delta });
+    if (term.screens.active.viewportIsBottom()) {
+        // At the bottom there is nothing (left) to scroll. Only a
+        // previously scrolled viewport needs to snap back to live; an
+        // already-live screen is unchanged, so it is not repainted.
+        if (scrolled.*) {
+            scrolled.* = false;
+            const msg: ?[]const u8 = if (message_deadline.* != 0) message.items else null;
+            renderState(term, false, msg);
+        }
+        return;
+    }
+    scrolled.* = true;
+    if (was_at_bottom) {
+        // Entering scrollback from the live bottom: the scrollback hint
+        // takes the bottom row, so a stale transient message is cleared,
+        // matching boo ui's scrollView.
+        message.clearRetainingCapacity();
+        message_deadline.* = 0;
+    }
+    const msg: ?[]const u8 = if (message_deadline.* != 0) message.items else null;
+    renderState(term, true, msg);
+}
+
+/// Return the viewport to the live bottom, clear any selection, and
+/// repaint. Used after scroll-back, an in-progress selection, or a
+/// snapped-back Esc. A still-active transient message stays on the
+/// bottom row, like boo ui (Esc snaps scrollback but not the message).
+fn resumeLive(
+    term: *vt.Terminal,
+    scrolled: *bool,
+    select_anchor: *?CellPos,
+    message: *std.ArrayList(u8),
+    message_deadline: *i64,
+) void {
+    if (scrolled.*) {
+        scrolled.* = false;
+        term.scrollViewport(.{ .bottom = {} });
+    }
+    if (select_anchor.*) |_| select_anchor.* = null;
+    const msg: ?[]const u8 = if (message_deadline.* != 0) message.items else null;
+    renderState(term, false, msg);
+}
+
+/// Handle a non-wheel mouse event, mirroring boo ui's viewport selection:
+/// applications that asked for mouse reporting get the raw event;
+/// otherwise a left-press starts a selection, drag extends it, and
+/// release copies the span to the clipboard via OSC 52.
+fn handleMouse(
+    term: *vt.Terminal,
+    scrolled: *bool,
+    ev: Mouse,
+    seq: []const u8,
+    sock: posix.fd_t,
+    select_anchor: *?CellPos,
+    select_head: *CellPos,
+    message: *std.ArrayList(u8),
+    message_deadline: *i64,
+) void {
+    if (term.flags.mouse_event != .none) {
+        protocol.writeMsg(sock, .input, seq) catch {};
+        return;
+    }
+    const cols = term.cols;
+    const rows = term.rows;
+    if (cols == 0 or rows == 0) return;
+    const x: u16 = @min(ev.x -| 1, cols - 1);
+    const y: u16 = @min(ev.y -| 1, rows - 1);
+
+    if (select_anchor.*) |anchor| {
+        // An in-progress selection: motion extends it, release copies.
+        if (!ev.release and !ev.isMotion()) return;
+        const moved = x != select_head.*.x or y != select_head.*.y;
+        select_head.* = .{ .x = x, .y = y };
+        if (!ev.release) {
+            if (moved) renderSelect(term, anchor, select_head.*);
+            return;
+        }
+        if (anchor.x != select_head.*.x or anchor.y != select_head.*.y) {
+            copySelection(term, anchor, select_head.*, message, message_deadline);
+        }
+        select_anchor.* = null;
+        const msg: ?[]const u8 = if (message_deadline.* != 0) message.items else null;
+        renderState(term, scrolled.*, msg);
+        return;
+    }
+
+    // No selection in progress: a left-press (no motion) starts one.
+    if (ev.release or ev.isMotion()) return;
+    if (ev.code & 3 != 0) return;
+    const start: CellPos = .{ .x = x, .y = y };
+    select_anchor.* = start;
+    select_head.* = start;
+    renderSelect(term, start, start);
+}
+
+/// Render the viewport with an in-progress selection highlighted in
+/// reverse video, like boo ui. The cursor is hidden; wheel capture is
+/// kept on. Used while a selection is active (live or scrolled).
+fn renderSelect(term: *vt.Terminal, anchor: CellPos, head: CellPos) void {
+    if (term.rows == 0 or term.cols == 0) return;
+    const alloc = std.heap.c_allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.appendSlice(alloc, window.sanitize_sequence) catch return;
+    out.appendSlice(alloc, "\x1b[?2026h\x1b[?25l") catch return;
+    var y: u16 = 0;
+    while (y < term.rows) : (y += 1) {
+        out.print(alloc, "\x1b[{d};1H\x1b[K", .{y + 1}) catch return;
+        viewterm.appendTermRow(alloc, term, y, &out) catch return;
+        // Overpaint the selected span in reverse video, like boo ui.
+        if (viewterm.selectionSpan(anchor, head, y, term.cols)) |span| {
+            out.print(alloc, "\x1b[{d};{d}H", .{ y + 1, span.x0 + 1 }) catch return;
+            out.appendSlice(alloc, viewterm.style_selected) catch return;
+            viewterm.appendPlainSpan(alloc, term, y, span.x0, span.x1, &out) catch return;
+            out.appendSlice(alloc, viewterm.sgr_reset) catch return;
+        }
+    }
+    out.appendSlice(alloc, "\x1b[?2026l") catch return;
+    if (term.flags.mouse_event == .none) {
+        out.appendSlice(alloc, mouse_capture) catch return;
+    }
+    _ = protocol.writeAll(posix.STDOUT_FILENO, out.items) catch {};
+}
+
+/// Copy the selected viewport text to the clipboard via OSC 52, which
+/// works over SSH and through nested multiplexers, and set a transient
+/// "copied N characters" confirmation on the bottom row. Mirrors boo ui.
+fn copySelection(
+    term: *vt.Terminal,
+    anchor: CellPos,
+    head: CellPos,
+    message: *std.ArrayList(u8),
+    message_deadline: *i64,
+) void {
+    const alloc = std.heap.c_allocator;
+    const text = viewterm.selectionPlainText(alloc, term, anchor, head) orelse return;
+    defer alloc.free(text);
+    if (text.len == 0) return;
+    const seq = osc52.copySequence(alloc, text) catch return;
+    defer alloc.free(seq);
+    _ = protocol.writeAll(posix.STDOUT_FILENO, seq) catch {};
+    message.clearRetainingCapacity();
+    message.print(alloc, "copied {d} characters", .{text.len}) catch {};
+    message_deadline.* = std.time.milliTimestamp() + message_ttl_ms;
+}
+
+/// Repaint the live screen onto the real terminal, re-establishing
+/// modes (cursor keys, bracketed paste, mouse, ...) so the real
+/// terminal mirrors the local terminal after a repaint or snap-back.
+fn renderLive(term: *vt.Terminal) void {
+    const alloc = std.heap.c_allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    out.writer.writeAll(window.sanitize_sequence) catch return;
+    {
+        var f: vt.formatter.TerminalFormatter = .init(term, .{ .emit = .vt });
+        f.content = .{ .selection = window.screenSelectionOf(term) };
+        // Keep the user's palette (emit palette references, not
+        // redefinitions); re-establish modes, scrolling region, tabstops,
+        // and keyboard protocol so the real terminal matches the local.
+        f.extra = .{
+            .palette = false,
+            .modes = true,
+            .scrolling_region = true,
+            .tabstops = true,
+            .pwd = false,
+            .keyboard = true,
+            .screen = .all,
+        };
+        out.writer.print("{f}", .{f}) catch return;
+    }
+    // sanitize above disabled mouse reporting; restore boo's wheel
+    // capture unless the application is using the mouse itself (its
+    // modes were re-emitted by the formatter), so the wheel reaches this
+    // client instead of turning into alternate-scroll arrow keys.
+    if (term.flags.mouse_event == .none) {
+        out.writer.writeAll(mouse_capture) catch return;
+    }
+    // The formatter's tabstop and scrolling-region extras move the
+    // cursor, so position it last, like the daemon's repaint.
+    window.writeCursorPosOf(term, &out.writer) catch return;
+    _ = protocol.writeAll(posix.STDOUT_FILENO, out.writer.buffered()) catch {};
+}
+
+/// Render the full viewport from the local terminal state with a status
+/// string overlaid on the bottom row. Used while scrolled (the scrollback
+/// hint) or while a transient message borrows the bottom row (the copy
+/// confirmation), mirroring boo ui's status row. `style` is the SGR prefix
+/// applied to the status text.
+fn renderViewportStatus(term: *vt.Terminal, status: []const u8, style: []const u8) void {
+    if (term.rows == 0 or term.cols == 0) return;
+    const alloc = std.heap.c_allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.appendSlice(alloc, window.sanitize_sequence) catch return;
+    out.appendSlice(alloc, "\x1b[?2026h\x1b[?25l") catch return;
+    var y: u16 = 0;
+    while (y < term.rows) : (y += 1) {
+        out.print(alloc, "\x1b[{d};1H\x1b[K", .{y + 1}) catch return;
+        viewterm.appendTermRow(alloc, term, y, &out) catch return;
+    }
+    out.print(alloc, "\x1b[{d};1H{s} {s}{s}\x1b[K", .{term.rows, style, status, viewterm.sgr_reset}) catch return;
+    out.appendSlice(alloc, "\x1b[?2026l") catch return;
+    if (term.flags.mouse_event == .none) {
+        out.appendSlice(alloc, mouse_capture) catch return;
+    }
+    _ = protocol.writeAll(posix.STDOUT_FILENO, out.items) catch {};
+}
+
+/// Render the viewport for the current overlay state: the transient
+/// message on the bottom row when one is active (overriding the scrollback
+/// hint, as in boo ui), else the scrolled history, else the live screen.
+/// An in-progress selection has its own render path (`renderSelect`) and
+/// is handled by the caller.
+fn renderState(term: *vt.Terminal, scrolled: bool, message_text: ?[]const u8) void {
+    if (message_text) |m| {
+        renderViewportStatus(term, m, style_dim);
+    } else if (scrolled) {
+        renderViewportStatus(term, "scrollback  wheel down or esc to return ", style_dim);
+    } else {
+        renderLive(term);
+    }
+}
+
+/// Re-establish wheel capture on the real terminal after a passthrough
+/// repaint disables mouse reporting, when the application isn't using the
+/// mouse. Used on screen-change repaints that arrive after the initial
+/// attach (where `renderLive` already handles it).
+fn ensureMouseCapture(term: *vt.Terminal) void {
+    if (term.flags.mouse_event != .none) return;
+    _ = protocol.writeAll(posix.STDOUT_FILENO, mouse_capture) catch {};
 }
 
 /// Probe the real terminal for its background color via an OSC 11 query

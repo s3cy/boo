@@ -165,6 +165,21 @@ fn isWrite(seq: []const u8) bool {
     return !(pd.len > 0 and pd[0] == '?');
 }
 
+/// Build an OSC 52 clipboard-copy sequence (`ESC ] 52 ; c ; <base64>
+/// BEL`) for `text`, caller-owned. Used by a client's own selection
+/// copy; works over SSH and through nested multiplexers like any other
+/// OSC 52 write. An empty `text` yields a clear-clipboard sequence.
+pub fn copySequence(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(alloc);
+    try seq.appendSlice(alloc, "\x1b]52;c;");
+    const b64 = try seq.addManyAsSlice(alloc, encoder.calcSize(text.len));
+    _ = encoder.encode(b64, text);
+    try seq.appendSlice(alloc, "\x07");
+    return alloc.dupe(u8, seq.items);
+}
+
 const Collector = struct {
     alloc: std.mem.Allocator,
     seqs: std.ArrayList([]u8) = .empty,

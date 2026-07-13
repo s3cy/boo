@@ -29,6 +29,7 @@ const osc52 = @import("osc52.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
+const viewterm = @import("viewterm.zig");
 const windowpkg = @import("window.zig");
 
 const log = std.log.scoped(.ui);
@@ -45,18 +46,19 @@ const refresh_interval_ms: i64 = 250;
 /// up instead of freezing. A timed-out poll leaves the session in place
 /// because a slow daemon is not a dead one.
 const control_timeout_ms: u32 = 3000;
-/// Transient status messages stay visible this long.
-const message_ttl_ms: i64 = 4000;
+/// Transient status messages (copy confirmation, ...) stay visible this
+/// long. Shared with boo attach.
+const message_ttl_ms = viewterm.message_ttl_ms;
 /// Render coalescing: at most one repaint per interval while output
 /// is streaming.
 const render_interval_ms: i64 = 15;
 /// A lone ESC held by the input parser is delivered as session input
 /// after this long without a follow-up byte. Escape sequences arrive
 /// as one chunk, so only a human pressing the ESC key waits this long.
-const esc_flush_ms: i64 = 50;
+const esc_flush_ms = viewterm.esc_flush_ms;
 /// Rows per mouse wheel tick, both for paging local scrollback and
 /// for the arrow keys sent to alternate-screen applications.
-const wheel_lines = 3;
+const wheel_lines = viewterm.wheel_lines;
 /// Kitty keyboard flags boo forces on the real terminal while the C-a
 /// prefix is engaged: "disambiguate" (1), "report event types" (2),
 /// and "report all keys as escape codes" (8). With these the command
@@ -152,24 +154,7 @@ pub const Layout = struct {
 // -- Input parsing ----------------------------------------------------------
 
 /// A mouse report from the terminal (SGR 1006 encoding).
-pub const Mouse = struct {
-    /// Raw SGR button code: low bits select the button, bit 2..4 are
-    /// modifiers, bit 5 marks motion, bit 6 marks wheel buttons.
-    code: u16,
-    /// 1-based terminal column.
-    x: u16,
-    /// 1-based terminal row.
-    y: u16,
-    release: bool,
-
-    pub fn isWheel(self: Mouse) bool {
-        return self.code & 64 != 0;
-    }
-
-    pub fn isMotion(self: Mouse) bool {
-        return self.code & 32 != 0;
-    }
-};
+pub const Mouse = viewterm.Mouse;
 
 pub const InputEvent = union(enum) {
     /// Bytes destined for the focused session.
@@ -804,31 +789,14 @@ pub const View = struct {
         fromHandler(handler).bell = true;
     }
 
-    const DeviceAttributes = EffectReturn("device_attributes");
-
-    fn EffectReturn(comptime field_name: []const u8) type {
-        const Effects = Stream.Handler.Effects;
-        const field = std.meta.fieldInfo(
-            Effects,
-            @field(std.meta.FieldEnum(Effects), field_name),
-        );
-        const Fn = @typeInfo(field.type).optional.child;
-        return @typeInfo(@typeInfo(Fn).pointer.child).@"fn".return_type.?;
-    }
+    const DeviceAttributes = viewterm.EffectReturn("device_attributes");
 
     fn effectDeviceAttributes(handler: *Stream.Handler) DeviceAttributes {
-        _ = handler;
-        return .{};
+        return viewterm.effectDeviceAttributes(handler);
     }
 
     fn effectSize(handler: *Stream.Handler) ?vt.size_report.Size {
-        const self = fromHandler(handler);
-        return .{
-            .rows = self.term.rows,
-            .columns = self.term.cols,
-            .cell_width = cell_px_w,
-            .cell_height = cell_px_h,
-        };
+        return viewterm.effectSize(handler);
     }
 
     fn effectTitleChanged(handler: *Stream.Handler) void {
@@ -867,8 +835,8 @@ pub const View = struct {
 
 // Nominal cell metrics reported to applications that ask for pixel
 // sizes (XTWINOPS, kitty); the same values the daemon reports.
-const cell_px_w = 8;
-const cell_px_h = 16;
+const cell_px_w = viewterm.cell_px_w;
+const cell_px_h = viewterm.cell_px_h;
 
 // -- Session list -------------------------------------------------------------
 
@@ -899,15 +867,15 @@ fn freeEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry)) void {
 
 // -- Sidebar rendering --------------------------------------------------------
 
-const sgr_reset = "\x1b[0m";
+const sgr_reset = viewterm.sgr_reset;
 /// Reverse video, used to highlight an in-progress mouse text selection
 /// over viewport content.
-const style_selected = "\x1b[7m";
+const style_selected = viewterm.style_selected;
 /// Dark gray background for the selected sidebar row. A gentle bar
 /// rather than reverse video, whose bright inverted block washes out
 /// the dim title row beneath the name.
 const style_row_selected = "\x1b[48;5;238m";
-const style_dim = "\x1b[2m";
+const style_dim = viewterm.style_dim;
 /// Bold blue: the "your turn" marker, a bell that rang while you were
 /// away.
 const style_attention = "\x1b[1;34m";
@@ -1111,7 +1079,7 @@ fn handleSignal(sig: c_int) callconv(.c) void {
 
 const enter_sequence =
     "\x1b[?1049h" ++ // alternate screen, saving the cursor
-    "\x1b[?1002h\x1b[?1006h" ++ // mouse: button events, SGR encoding
+    viewterm.mouse_capture ++ // mouse: button events, SGR encoding
     "\x1b[?1004h" ++ // focus reporting
     "\x1b[?2004h" ++ // bracketed paste
     "\x1b[=0;1u\x1b[>4;0m" ++ // keyboard protocols off until a view sets them
@@ -1312,7 +1280,7 @@ const Ui = struct {
     /// repeating into the shell would log the user out.
     eof_guard: bool = false,
 
-    const CellPos = struct { x: u16, y: u16 };
+    const CellPos = viewterm.CellPos;
 
     fn deinit(self: *Ui) void {
         if (self.view) |v| v.destroy();
@@ -1889,10 +1857,7 @@ const Ui = struct {
         if (v.term.flags.mouse_event != .none) return self.forwardMouse(m);
         const down = m.code & 1 != 0;
         if (v.app_alt) {
-            const seq: []const u8 = if (v.term.modes.get(.cursor_keys))
-                (if (down) "\x1bOB" else "\x1bOA")
-            else
-                (if (down) "\x1b[B" else "\x1b[A");
+            const seq = viewterm.cursorArrowSeq(&v.term, down);
             for (0..wheel_lines) |_| {
                 v.sendInput(seq) catch return self.markViewLost();
             }
@@ -2030,49 +1995,22 @@ const Ui = struct {
 
     /// The selection's inclusive span on viewport row `y`, or null
     /// when the row is outside the selection.
-    fn selectionSpan(self: *Ui, y: u16, cols: u16) ?struct { x0: u16, x1: u16 } {
+    fn selectionSpan(self: *Ui, y: u16, cols: u16) ?viewterm.Span {
         const anchor = self.select_anchor orelse return null;
-        if (cols == 0) return null;
-        var s = anchor;
-        var e = self.select_head;
-        if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
-        if (y < s.y or y > e.y) return null;
-        const x0: u16 = if (y == s.y) @min(s.x, cols - 1) else 0;
-        const x1: u16 = if (y == e.y) @min(e.x, cols - 1) else cols - 1;
-        if (x0 > x1) return null;
-        return .{ .x0 = x0, .x1 = x1 };
+        return viewterm.selectionSpan(anchor, self.select_head, y, cols);
     }
 
     /// Copy the selected viewport text to the clipboard via OSC 52,
     /// which works over SSH and through nested multiplexers.
     fn copySelection(self: *Ui, v: *View) void {
         const alloc = self.alloc;
-
-        var s = self.select_anchor.?;
-        var e = self.select_head;
-        if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
-
-        const screen = v.term.screens.active;
-        const start = screen.pages.pin(.{ .viewport = .{ .x = s.x, .y = s.y } }) orelse return;
-        const end = screen.pages.pin(.{ .viewport = .{ .x = e.x, .y = e.y } }) orelse return;
-
-        var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
-        formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
-
-        var aw: std.Io.Writer.Allocating = .init(alloc);
-        defer aw.deinit();
-        aw.writer.print("{f}", .{formatter}) catch return;
-        const text = aw.writer.buffered();
+        const text = viewterm.selectionPlainText(alloc, &v.term, self.select_anchor.?, self.select_head) orelse return;
+        defer alloc.free(text);
         if (text.len == 0) return;
 
-        const encoder = std.base64.standard.Encoder;
-        var seq: std.ArrayList(u8) = .empty;
-        defer seq.deinit(alloc);
-        seq.appendSlice(alloc, "\x1b]52;c;") catch return;
-        const b64 = seq.addManyAsSlice(alloc, encoder.calcSize(text.len)) catch return;
-        _ = encoder.encode(b64, text);
-        seq.appendSlice(alloc, "\x07") catch return;
-        protocol.writeAll(1, seq.items) catch {};
+        const seq = osc52.copySequence(alloc, text) catch return;
+        defer alloc.free(seq);
+        protocol.writeAll(1, seq) catch {};
 
         self.setMessage("copied {d} characters", .{text.len});
     }
@@ -3179,7 +3117,7 @@ const Ui = struct {
         }
 
         entry.bytes.clearRetainingCapacity();
-        try appendTermRow(alloc, &v.term, y, &entry.bytes);
+        try viewterm.appendTermRow(alloc, &v.term, y, &entry.bytes);
         entry.node = node;
         entry.offset = pin.y;
         entry.valid = true;
@@ -3238,7 +3176,7 @@ const Ui = struct {
                 self.layout.viewportX() + span.x0 + 1,
             });
             try out.appendSlice(alloc, style_selected);
-            try appendPlainSpan(alloc, &v.term, y, span.x0, span.x1, out);
+            try viewterm.appendPlainSpan(alloc, &v.term, y, span.x0, span.x1, out);
             try out.appendSlice(alloc, sgr_reset);
         }
     }
@@ -3314,64 +3252,6 @@ const Ui = struct {
     }
 };
 
-/// Append one row of the terminal's active screen as styled VT bytes.
-/// Rendered through libghostty's own formatter, so styles, wide
-/// characters, and blank runs come out exactly as the daemon would
-/// replay them, just one row at a time.
-pub fn appendTermRow(
-    alloc: std.mem.Allocator,
-    term: *vt.Terminal,
-    y: u16,
-    out: *std.ArrayList(u8),
-) !void {
-    const screen = term.screens.active;
-    if (term.cols == 0) return;
-    // Viewport pins follow scrollback paging; at the bottom the
-    // viewport and the active screen are the same rows.
-    const start = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse return;
-    const end = screen.pages.pin(.{ .viewport = .{ .x = term.cols - 1, .y = y } }) orelse return;
-
-    var formatter: vt.formatter.ScreenFormatter = .init(screen, .vt);
-    formatter.content = .{ .selection = vt.Selection.init(start, end, true) };
-
-    // Format straight into `out`, reusing its capacity, so a repaint
-    // does not allocate a fresh writer for every row.
-    const begin = out.items.len;
-    {
-        var aw: std.Io.Writer.Allocating = .fromArrayList(alloc, out);
-        defer out.* = aw.toArrayList();
-        aw.writer.print("{f}", .{formatter}) catch return error.OutOfMemory;
-    }
-    // A row that opened a hyperlink must not leak it into the next
-    // row or the sidebar.
-    if (std.mem.indexOf(u8, out.items[begin..], "\x1b]8;") != null) {
-        try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
-    }
-}
-
-/// Append one row's cells in [x0, x1] inclusive as plain text, with
-/// trailing blanks trimmed. Used to repaint the selection highlight
-/// over already-rendered row content.
-fn appendPlainSpan(
-    alloc: std.mem.Allocator,
-    term: *vt.Terminal,
-    y: u16,
-    x0: u16,
-    x1: u16,
-    out: *std.ArrayList(u8),
-) !void {
-    const screen = term.screens.active;
-    const start = screen.pages.pin(.{ .viewport = .{ .x = x0, .y = y } }) orelse return;
-    const end = screen.pages.pin(.{ .viewport = .{ .x = x1, .y = y } }) orelse return;
-
-    var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
-    formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
-
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-    aw.writer.print("{f}", .{formatter}) catch return error.OutOfMemory;
-    try out.appendSlice(alloc, aw.writer.buffered());
-}
 
 // -- Tests --------------------------------------------------------------------
 
@@ -4435,7 +4315,7 @@ test "appendTermRow preserves multi-byte UTF-8 session content" {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    try appendTermRow(alloc, &term, 0, &out);
+    try viewterm.appendTermRow(alloc, &term, 0, &out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "你好") != null);
 }
 
@@ -4451,12 +4331,12 @@ test "appendTermRow renders styled content for one row only" {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    try appendTermRow(alloc, &term, 0, &out);
+    try viewterm.appendTermRow(alloc, &term, 0, &out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "first") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "red") == null);
 
     out.clearRetainingCapacity();
-    try appendTermRow(alloc, &term, 1, &out);
+    try viewterm.appendTermRow(alloc, &term, 1, &out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "red") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "first") == null);
     // Leading blanks are preserved so columns line up.
@@ -4466,7 +4346,7 @@ test "appendTermRow renders styled content for one row only" {
 
     // Blank rows render as nothing (the caller clears with EL).
     out.clearRetainingCapacity();
-    try appendTermRow(alloc, &term, 3, &out);
+    try viewterm.appendTermRow(alloc, &term, 3, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
@@ -4487,7 +4367,7 @@ test "viewportRowReusable re-serializes a clean row that scrolled away" {
     defer for (&entries) |*e| e.deinit(alloc);
     for (0..4) |y| {
         const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = @intCast(y) } }).?;
-        try appendTermRow(alloc, &term, @intCast(y), &entries[y].bytes);
+        try viewterm.appendTermRow(alloc, &term, @intCast(y), &entries[y].bytes);
         entries[y].node = @ptrCast(pin.node);
         entries[y].offset = pin.y;
         entries[y].valid = true;

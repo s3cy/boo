@@ -422,7 +422,16 @@ fn attachLoop(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
     while (true) {
         const sock = try paths.socketPath(alloc, dir, current);
         defer alloc.free(sock);
-        const outcome = client.attach(alloc, sock) catch |err| switch (err) {
+        // boo attach feeds session output through an in-process libghostty
+        // stream whose VT logs (OSC/icon handling, etc.) would otherwise
+        // paint over the session: std.log writes to stderr, which is the
+        // user's terminal here. Point stderr at BOO_LOG, or /dev/null,
+        // while attached, then restore it so the closing notice is
+        // visible. Mirrors boo ui.
+        const saved_stderr = redirectStderr();
+        const result = client.attach(alloc, sock);
+        restoreStderr(saved_stderr);
+        const outcome = result catch |err| switch (err) {
             error.FileNotFound, error.ConnectionRefused => fail(
                 exit_no_session,
                 "no session named {s}",
@@ -1193,6 +1202,7 @@ test {
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
     _ = @import("osc52.zig");
+    _ = @import("viewterm.zig");
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
